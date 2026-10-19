@@ -26,7 +26,8 @@ Useful ingest options:
 ```bash
 cip ingest                                   # OHLCV from Binance (default)
 cip ingest --datasets funding,open_interest  # derivatives, opt-in
-cip ingest --provider coingecko              # USD index, 4h, last 30 days (cross-check source)
+cip ingest --provider coinbase               # independent spot OHLCV with volume (since 2024: ~4.5 min)
+cip ingest --provider coingecko              # USD index, 4h, last 30 days
 cip ingest --symbols BTC-USDT --markets perp --intervals 15m --since 2025-01-01
 cip ingest --full-refresh                    # re-fetch from --since; upsert dedupes
 ```
@@ -39,7 +40,8 @@ MarketDataProvider          identity + supports()
   ├── FundingSource          fetch_funding_rates
   └── OpenInterestSource     fetch_open_interest
 
-BinanceProvider   = OHLCV + Funding + OpenInterest   (spot, perp)
+BinanceProvider   = OHLCV + Funding + OpenInterest   (spot, perp)       primary
+CoinbaseProvider  = OHLCV                            (spot, USD book)   secondary / cross-check
 CoinGeckoProvider = OHLCV                            (index, 4h, no volume)
 ```
 
@@ -83,6 +85,11 @@ Gaps are never filled.
 - **Binance** spot and USD-M perpetual public endpoints, no key required.
   Open-interest history is limited to **~30 days**. Run `cip ingest` regularly and
   the local history grows from there.
+- **Coinbase Exchange** public API, no key required. Spot candles with real volume and
+  years of history. USDT/USDC symbols read the USD book, because Coinbase's USDT books
+  are thin. 4h candles are built from 1h candles, since Coinbase has no 4h granularity.
+  Max 300 candles per call. Against Binance 2024–2026: median close difference −0.01%,
+  99th percentile 0.19%.
 - **CoinGecko** public API, no key required (a free Demo key raises the rate limit).
   It provides a cross-exchange USD index (USDT/USDC treated as USD), 4h candles for the
   last 30 days, and no volume. It's stored as `market=index`, for cross-checks only.

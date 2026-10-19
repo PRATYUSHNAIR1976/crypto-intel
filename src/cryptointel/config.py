@@ -30,10 +30,12 @@ class Settings(BaseSettings):
 
     # Read side: for each series, the first provider in this list that has data is used.
     # One source per series — rows from different providers are never mixed.
-    source_priority: Annotated[list[str], NoDecode] = ["binance", "coingecko"]
+    source_priority: Annotated[list[str], NoDecode] = ["binance", "coinbase", "coingecko"]
 
     binance_spot_base_url: str = "https://api.binance.com"
     binance_futures_base_url: str = "https://fapi.binance.com"
+
+    coinbase_base_url: str = "https://api.exchange.coinbase.com"
 
     coingecko_base_url: str = "https://api.coingecko.com/api/v3"
     coingecko_api_key: SecretStr = SecretStr("")  # optional free Demo key; raises rate limits

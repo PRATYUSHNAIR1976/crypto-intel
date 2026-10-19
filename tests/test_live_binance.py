@@ -40,6 +40,17 @@ def test_live_coingecko_ohlc_contract():
     assert not validate(frame, Dataset.OHLCV, Interval.H4).has_errors
 
 
+@pytest.mark.parametrize("interval", [Interval.H1, Interval.H4])
+def test_live_coinbase_ohlcv_contract(interval):
+    from cryptointel.providers.coinbase import CoinbaseProvider
+
+    end = utc_now()
+    frame = CoinbaseProvider().fetch_ohlcv("BTC-USDT", Market.SPOT, interval, end - timedelta(days=2), end).frame
+    assert len(frame) >= 48 // (interval.ms // Interval.H1.ms) - 2
+    assert (frame["volume"] > 0).all()
+    assert not validate(frame, Dataset.OHLCV, interval).has_errors
+
+
 def test_live_open_interest_contract(provider):
     end = utc_now()
     frame = provider.fetch_open_interest("BTC-USDT", Interval.H1, end - timedelta(hours=6), end).frame

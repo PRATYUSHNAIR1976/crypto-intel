@@ -5,9 +5,10 @@ from __future__ import annotations
 from cryptointel.config import Settings
 from cryptointel.providers.base import MarketDataProvider
 from cryptointel.providers.binance import BinanceProvider
+from cryptointel.providers.coinbase import CoinbaseProvider
 from cryptointel.providers.coingecko import CoinGeckoProvider
 
-PROVIDER_NAMES = ("binance", "coingecko")
+PROVIDER_NAMES = ("binance", "coinbase", "coingecko")
 
 
 def build_provider(name: str, settings: Settings) -> MarketDataProvider:
@@ -16,6 +17,11 @@ def build_provider(name: str, settings: Settings) -> MarketDataProvider:
             spot_base_url=settings.binance_spot_base_url, futures_base_url=settings.binance_futures_base_url,
             timeout=settings.http_timeout_seconds, request_pause_seconds=settings.request_pause_seconds,
             max_attempts=settings.retry_max_attempts,
+        )
+    if name == "coinbase":
+        return CoinbaseProvider(
+            base_url=settings.coinbase_base_url, timeout=settings.http_timeout_seconds,
+            request_pause_seconds=settings.request_pause_seconds, max_attempts=settings.retry_max_attempts,
         )
     if name == "coingecko":
         return CoinGeckoProvider(
