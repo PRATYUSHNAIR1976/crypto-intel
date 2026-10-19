@@ -1,0 +1,19 @@
+# secrets
+.env
+
+# local data (re-creatable via `cip ingest`)
+data/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# os / editors
+.DS_Store
+.vscode/
+.idea/

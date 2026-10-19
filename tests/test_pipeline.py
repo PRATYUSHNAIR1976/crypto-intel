@@ -1,0 +1,116 @@
+from datetime import timedelta
+
+import pandas as pd
+
+from cryptointel.domain.models import Dataset, Interval, Market
+from cryptointel.ingestion.pipeline import IngestionJob, IngestionPipeline
+from cryptointel.providers.base import FetchResult, MarketDataProvider, RawPage
+from cryptointel.storage.catalog import Catalog
+from cryptointel.storage.parquet_store import ParquetStore, QuarantineStore
+from cryptointel.storage.raw import RawStore
+from tests.conftest import NOW, T0, ohlcv_frame
+
+
+class FakeProvider(MarketDataProvider):
+    """Serves a fixed in-memory OHLCV history; records requested windows."""
+
+    name = "binance"
+
+    def __init__(self, history: pd.DataFrame, fail: bool = False):
+        self.history = history
+        self.fail = fail
+        self.requests: list[tuple] = []
+
+    def supports(self, dataset, market):
+        return dataset is Dataset.OHLCV
+
+    def fetch_ohlcv(self, symbol, market, interval, start, end):
+        self.requests.append((start, end))
+        if self.fail:
+            raise ConnectionError("exchange unreachable")
+        rows = self.history[(self.history["ts"] >= start) & (self.history["ts"] <= end)]
+        page = RawPage("fake://klines", {"start": str(start)}, 200, NOW, rows.to_dict("records"))
+        return FetchResult(Dataset.OHLCV, rows.copy(), [page])
+
+    def fetch_funding_rates(self, *a):
+        raise NotImplementedError
+
+    def fetch_open_interest(self, *a):
+        raise NotImplementedError
+
+
+def build(tmp_path, provider, clock=lambda: NOW):
+    store = ParquetStore(tmp_path / "normalized")
+    catalog = Catalog(tmp_path / "catalog.sqlite")
+    pipe = IngestionPipeline(provider, RawStore(tmp_path / "raw"), store, QuarantineStore(tmp_path / "quarantine"),
+                             catalog, clock=clock)
+    return pipe, store, catalog
+
+
+JOB = IngestionJob(Dataset.OHLCV, "BTC-USDT", Market.SPOT, Interval.H1, T0)
+
+
+def test_end_to_end_ingest_with_quarantine(tmp_path):
+    history = ohlcv_frame(24)
+    history.loc[5, "close"] = None  # one corrupt candle
+    pipe, store, catalog = build(tmp_path, FakeProvider(history))
+
+    report = pipe.run(JOB)
+
+    assert report.status == "success_with_quarantine"
+    assert (report.rows_fetched, report.rows_written, report.rows_quarantined) == (24, 23, 1)
+    assert len(store.read(Dataset.OHLCV, "binance", "spot", "BTC-USDT", "1h")) == 23
+    assert list((tmp_path / "quarantine" / "ohlcv").glob("*.parquet"))
+    assert list((tmp_path / "raw").rglob("*.json.gz"))
+    run = catalog.recent_runs()[0]
+    assert run["run_id"] == report.run_id and run["status"] == "success_with_quarantine"
+    assert {i["check_name"] for i in catalog.issues(run_id=report.run_id)} >= {"null_close", "missing_intervals"}
+
+
+def test_incremental_run_resumes_after_latest_stored_candle(tmp_path):
+    history = ohlcv_frame(48)
+    provider = FakeProvider(history)
+    first_clock = T0 + timedelta(hours=24)
+    pipe, store, _ = build(tmp_path, provider, clock=lambda: first_clock)
+    assert pipe.run(JOB).rows_written == 24  # 24 closed candles at t0+24h
+
+    pipe2, _, _ = build(tmp_path, provider, clock=lambda: T0 + timedelta(hours=48))
+    report = pipe2.run(JOB)
+
+    assert provider.requests[-1][0] == T0 + timedelta(hours=24)
+    assert report.rows_written == 24
+    assert len(store.read(Dataset.OHLCV, "binance", "spot", "BTC-USDT", "1h")) == 48
+
+
+def test_up_to_date_does_not_call_provider(tmp_path):
+    provider = FakeProvider(ohlcv_frame(24))
+    clock = lambda: T0 + timedelta(hours=24, minutes=30)  # noqa: E731
+    pipe, _, _ = build(tmp_path, provider, clock=clock)
+    pipe.run(JOB)
+    calls = len(provider.requests)
+    assert pipe.run(JOB).status == "up_to_date"
+    assert len(provider.requests) == calls
+
+
+def test_provider_failure_is_recorded_not_raised(tmp_path):
+    pipe, _, catalog = build(tmp_path, FakeProvider(ohlcv_frame(5), fail=True))
+    report = pipe.run(JOB)
+    assert report.status == "failed" and "exchange unreachable" in report.error
+    assert catalog.recent_runs()[0]["status"] == "failed"
+
+
+def test_unsupported_dataset_is_skipped(tmp_path):
+    pipe, _, _ = build(tmp_path, FakeProvider(ohlcv_frame(5)))
+    report = pipe.run(IngestionJob(Dataset.FUNDING, "BTC-USDT", Market.PERP, None, T0))
+    assert report.status == "unsupported"
+
+
+def test_full_audit_detects_boundary_gap(tmp_path):
+    from cryptointel.validation.audit import audit_store
+
+    store = ParquetStore(tmp_path)
+    store.upsert(Dataset.OHLCV, ohlcv_frame(48).drop(index=range(10, 13)))
+    audits = audit_store(store)
+    assert len(audits) == 1
+    gap = [i for i in audits[0].issues if i.check == "missing_intervals"][0]
+    assert gap.affected_rows == 3 and audits[0].rows == 45
