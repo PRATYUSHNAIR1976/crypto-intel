@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     retry_max_attempts: int = 4
 
     log_level: str = "INFO"
+    log_format: Literal["json", "text"] = "json"
 
     _csv = field_validator("symbols", "markets", "intervals", "datasets", "source_priority", mode="before")(_split_csv)
 
@@ -54,8 +55,9 @@ class Settings(BaseSettings):
         return self.data_dir / "raw"
 
     @property
-    def normalized_dir(self) -> Path:
-        return self.data_dir / "normalized"
+    def processed_dir(self) -> Path:
+        """Validated, canonical Parquet (the 'silver' layer)."""
+        return self.data_dir / "processed"
 
     @property
     def quarantine_dir(self) -> Path:

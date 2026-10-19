@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
 from datetime import datetime, timezone
 
@@ -12,6 +11,7 @@ import pandas as pd
 from cryptointel.config import Settings, get_settings
 from cryptointel.domain.models import Dataset, Interval, Market, normalize_symbol
 from cryptointel.ingestion.pipeline import IngestionJob, IngestionPipeline, IngestionReport
+from cryptointel.logging_config import configure_logging
 from cryptointel.providers.base import MarketDataProvider
 from cryptointel.providers.registry import PROVIDER_NAMES, build_provider
 from cryptointel.storage.catalog import Catalog
@@ -79,7 +79,7 @@ def cmd_ingest(args: argparse.Namespace, settings: Settings) -> int:
               f"markets={[m.value for m in markets]} intervals={[i.value for i in intervals]}.")
         return 0
     pipeline = IngestionPipeline(
-        provider, RawStore(settings.raw_dir), ParquetStore(settings.normalized_dir),
+        provider, RawStore(settings.raw_dir), ParquetStore(settings.processed_dir),
         QuarantineStore(settings.quarantine_dir), Catalog(settings.catalog_path), incremental=not args.full_refresh,
     )
     reports = pipeline.run_all(jobs)
@@ -88,7 +88,7 @@ def cmd_ingest(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def cmd_validate(args: argparse.Namespace, settings: Settings) -> int:
-    audits = audit_store(ParquetStore(settings.normalized_dir), Catalog(settings.catalog_path))
+    audits = audit_store(ParquetStore(settings.processed_dir), Catalog(settings.catalog_path))
     if not audits:
         print("No data stored yet. Run `cip ingest` first.")
         return 0
@@ -109,7 +109,7 @@ def cmd_validate(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def cmd_summary(args: argparse.Namespace, settings: Settings) -> int:
-    df = MarketDataRepository(settings.normalized_dir).summary()
+    df = MarketDataRepository(settings.processed_dir).summary()
     print("No data stored yet." if df.empty else df.to_string(index=False))
     return 0
 
@@ -145,8 +145,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     settings = get_settings()
-    logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    configure_logging(settings.log_level, settings.log_format)
     return args.func(args, settings)
 
 

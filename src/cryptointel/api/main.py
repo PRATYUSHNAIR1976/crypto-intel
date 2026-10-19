@@ -34,7 +34,7 @@ def _symbol(value: str) -> str:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
-    repo = MarketDataRepository(settings.normalized_dir)
+    repo = MarketDataRepository(settings.processed_dir)
     reader = SourceResolvingReader(repo, settings.source_priority)  # market data is served source-agnostic
     catalog = Catalog(settings.catalog_path)
 

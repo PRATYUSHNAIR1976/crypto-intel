@@ -48,6 +48,7 @@ class BinanceProvider(MarketDataProvider, OHLCVSource, FundingSource, OpenIntere
         Dataset.OPEN_INTEREST: {Market.PERP},
     }
 
+    WEIGHT_LIMIT_PER_MINUTE = 2400
     KLINE_LIMIT = 1000
     FUNDING_LIMIT = 1000
     OI_LIMIT = 500
@@ -68,14 +69,19 @@ class BinanceProvider(MarketDataProvider, OHLCVSource, FundingSource, OpenIntere
         self._spot = spot_base_url.rstrip("/")
         self._futures = futures_base_url.rstrip("/")
         self._clock = clock
-        self._get = JsonHttpClient(
+        self._http = JsonHttpClient(
             self.name, client=client, timeout=timeout, request_pause_seconds=request_pause_seconds,
             max_attempts=max_attempts, backoff_seconds=backoff_seconds, clock=clock,
             fail_fast_messages={
                 418: "IP auto-banned for ignoring rate limits. Back off.",
                 451: "unavailable from this region. Configure another provider.",
             },
-        ).get
+            # Binance reports per-IP request weight used in the current minute. Spot allows
+            # 6000/min and USD-M futures 2400/min; one client serves both, so use the lower.
+            weight_header="x-mbx-used-weight-1m",
+            weight_limit=self.WEIGHT_LIMIT_PER_MINUTE,
+        )
+        self._get = self._http.get
 
     # ------------------------------------------------------------ interface
     def supports(self, dataset: Dataset, market: Market, interval: Interval | None = None) -> bool:

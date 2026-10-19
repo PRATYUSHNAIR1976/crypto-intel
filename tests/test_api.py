@@ -12,7 +12,7 @@ from tests.conftest import NOW, T0, ohlcv_frame
 
 @pytest.fixture
 def client(settings):
-    store = ParquetStore(settings.normalized_dir)
+    store = ParquetStore(settings.processed_dir)
     store.upsert(Dataset.OHLCV, ohlcv_frame(48))
     store.upsert(Dataset.FUNDING, coerce(pd.DataFrame({
         "ts": pd.date_range(T0, periods=3, freq="8h", tz="UTC"), "provider": "binance", "market": "perp",

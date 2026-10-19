@@ -32,14 +32,18 @@ def retry_on_exception(
                     return func(*args, **kwargs)
                 except allowed_exceptions as exc:
                     last_exception = exc
-                    logger.warning("Attempt %d/%d failed for %s: %s", attempt, max_attempts, func.__name__, exc)
                     if attempt == max_attempts:
                         break
                     delay = initial_delay * (backoff_factor ** (attempt - 1))
                     if jitter and delay > 0:
                         delay += random.uniform(0, 0.5)
+                    logger.warning("attempt failed; retrying", extra={
+                        "event": "retry", "func": func.__name__, "attempt": attempt,
+                        "max_attempts": max_attempts, "delay_s": round(delay, 2), "error": str(exc)})
                     time.sleep(delay)
-            logger.error("All %d attempts failed for %s", max_attempts, func.__name__)
+            logger.error("all attempts failed", extra={
+                "event": "retry_exhausted", "func": func.__name__, "max_attempts": max_attempts,
+                "error": str(last_exception)})
             raise last_exception  # type: ignore[misc]
 
         return wrapper

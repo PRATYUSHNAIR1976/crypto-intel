@@ -127,10 +127,11 @@ class IngestionPipeline:
             report.quality_score = validation.quality_score
             report.issues = validation.issues
             report.status = "success_with_quarantine" if validation.has_errors else "success"
-        except Exception as exc:  # recorded, not swallowed: surfaces in catalog, CLI and API
-            logger.exception("Ingestion failed for %s", job.label())
+        except Exception as exc:  # recorded, not swallowed: surfaces in catalog, CLI, API and logs
             report.status = "failed"
             report.error = f"{type(exc).__name__}: {exc}"
+            logger.error("ingestion failed", exc_info=True, extra={
+                "event": "ingest_failed", "run_id": run_id, **meta, "error": report.error})
 
         self.catalog.finish_run(
             run_id, status=report.status, rows_fetched=report.rows_fetched, rows_written=report.rows_written,
@@ -138,11 +139,19 @@ class IngestionPipeline:
             quality_score=report.quality_score, raw_path=report.raw_path, error=report.error,
         )
         self.catalog.record_issues(report.issues, scope="ingest", run_id=run_id, **meta)
+        logger.info("ingestion finished", extra={
+            "event": "ingest_finished", "run_id": run_id, **meta, "status": report.status,
+            "rows_fetched": report.rows_fetched, "rows_written": report.rows_written,
+            "rows_quarantined": report.rows_quarantined, "rows_dropped": report.rows_dropped,
+            "quality_score": report.quality_score,
+            "warnings": [i.check for i in report.issues if i.severity == "warning"],
+        })
         return report
 
     def run_all(self, jobs: list[IngestionJob]) -> list[IngestionReport]:
         reports = []
         for job in jobs:
-            logger.info("Ingesting %s", job.label())
+            logger.info("ingestion started", extra={"event": "ingest_started", "job": job.label(),
+                                                    "provider": self.provider.name})
             reports.append(self.run(job))
         return reports
