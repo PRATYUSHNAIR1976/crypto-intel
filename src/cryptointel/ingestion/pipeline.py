@@ -13,7 +13,14 @@ from datetime import datetime, timedelta
 from typing import Callable
 
 from cryptointel.domain.models import Dataset, Interval, Market, utc_now
-from cryptointel.providers.base import FetchResult, MarketDataProvider
+from cryptointel.providers.base import (
+    FetchResult,
+    FundingSource,
+    MarketDataProvider,
+    OHLCVSource,
+    OpenInterestSource,
+    ProviderError,
+)
 from cryptointel.storage.catalog import Catalog
 from cryptointel.storage.parquet_store import ParquetStore, QuarantineStore
 from cryptointel.storage.raw import RawStore
@@ -74,11 +81,14 @@ class IngestionPipeline:
         return max(job.start, (latest + step).to_pydatetime())
 
     def _fetch(self, job: IngestionJob, start: datetime, end: datetime) -> FetchResult:
-        if job.dataset is Dataset.OHLCV:
-            return self.provider.fetch_ohlcv(job.symbol, job.market, job.interval, start, end)
-        if job.dataset is Dataset.FUNDING:
-            return self.provider.fetch_funding_rates(job.symbol, start, end)
-        return self.provider.fetch_open_interest(job.symbol, job.interval, start, end)
+        p = self.provider
+        if job.dataset is Dataset.OHLCV and isinstance(p, OHLCVSource):
+            return p.fetch_ohlcv(job.symbol, job.market, job.interval, start, end)
+        if job.dataset is Dataset.FUNDING and isinstance(p, FundingSource):
+            return p.fetch_funding_rates(job.symbol, start, end)
+        if job.dataset is Dataset.OPEN_INTEREST and isinstance(p, OpenInterestSource):
+            return p.fetch_open_interest(job.symbol, job.interval, start, end)
+        raise ProviderError(f"{p.name} has no {job.dataset} capability")
 
     def run(self, job: IngestionJob) -> IngestionReport:
         run_id = uuid.uuid4().hex[:12]
@@ -88,9 +98,9 @@ class IngestionPipeline:
         meta = dict(provider=self.provider.name, dataset=job.dataset.value, market=job.market.value,
                     symbol=job.symbol, interval=interval)
 
-        if not self.provider.supports(job.dataset, job.market):
+        if not self.provider.supports(job.dataset, job.market, job.interval):
             return IngestionReport(run_id, job, "unsupported",
-                                   error=f"{self.provider.name} does not support {job.dataset} on {job.market}")
+                                   error=f"{self.provider.name} does not support {job.label()}")
 
         start = self._resolve_start(job)
         report = IngestionReport(run_id, job, "running", effective_start=start)

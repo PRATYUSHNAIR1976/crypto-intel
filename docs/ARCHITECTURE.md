@@ -3,8 +3,25 @@
 Local-first crypto trading **intelligence** platform for research and education.
 No live trading, no order execution, no exchange-account integration, no paid services.
 
-Status: **Phase 1 implemented** (data foundation). Later phases are proposals and
-are not built until approved.
+Status: **Phase 1 and 1.1 implemented** (data foundation and source independence).
+Later phases are proposals and are not built until approved.
+
+## Core engineering rule: the strategy engine never knows where data came from
+
+```
+MarketDataProvider ── OHLCVSource / FundingSource / OpenInterestSource
+   ├── BinanceProvider     (OHLCV + funding + OI)
+   ├── CoinGeckoProvider   (OHLCV, index only)
+   └── FutureProvider      (implements only the capabilities it has)
+          │  ingestion: fetch → raw → validate → canonical Parquet
+          ▼
+   MarketDataReader (domain/ports.py)   ← the ONLY data interface for features/regime/strategy/scanner/risk
+          • one provider per series, chosen by CIP_SOURCE_PRIORITY (never mixed)
+          • frames carry no provider / ingested_at columns
+```
+
+Enforced by `tests/test_architecture.py`, which inspects imports with `ast`. Swapping or adding a
+provider changes ingestion and configuration only, never analytics.
 
 ---
 
@@ -13,6 +30,8 @@ are not built until approved.
 | Phase | Scope | MVP items |
 |---|---|---|
 | **1 ✅** | Provider interface, Binance public adapter, raw landing, validation/quarantine, normalized Parquet, DuckDB query layer, SQLite catalog, CLI, read-only API | 1, 2, 3 |
+| **1.1 ✅** | Capability-based provider interfaces, CoinGecko adapter (2nd source), `MarketDataReader` port with one source per series, OHLCV-first default, architecture test | 1 |
+| 1.2 | Liquidations: always-on WebSocket collector (Binance `!forceOrder@arr`); history only from first run | — |
 | 2 | Feature engineering (transparent indicators) + glossary knowledge base (YAML) | 4, 8 (data) |
 | 3 | Market-regime detection + deterministic strategy engine + opportunity scanner + explainable signal objects | 5, 6, 7 |
 | 4 | Streamlit dashboard: market overview, symbol detail, scanner, clickable glossary, data health | 9, 8 (UI) |
@@ -34,16 +53,21 @@ crypto-intel/
 │   ├── config.py             # pydantic-settings, CIP_* env vars
 │   ├── retry.py              # backoff decorator (adapted from stock-index-app)
 │   ├── domain/
-│   │   ├── models.py         # Market, Dataset, Interval, canonical symbols
-│   │   └── schemas.py        # canonical table schemas + primary keys
+│   │   ├── models.py         # Market (spot/perp/index), Dataset, Interval, canonical symbols
+│   │   ├── schemas.py        # canonical table schemas + primary keys
+│   │   └── ports.py          # MarketDataReader: the only data port for analytics
 │   ├── providers/
-│   │   ├── base.py           # MarketDataProvider ABC, RawPage, FetchResult
-│   │   └── binance.py        # Binance public REST adapter
+│   │   ├── base.py           # MarketDataProvider + capability ABCs, RawPage, FetchResult
+│   │   ├── http.py           # shared JSON GET: retry, 429 handling, raw capture
+│   │   ├── binance.py        # Binance public REST adapter
+│   │   ├── coingecko.py      # CoinGecko public adapter (OHLCV, index)
+│   │   └── registry.py       # build provider by name from settings
 │   ├── storage/
 │   │   ├── raw.py            # immutable gzipped raw payloads
 │   │   ├── parquet_store.py  # normalized series + quarantine
 │   │   ├── catalog.py        # SQLite lineage + DQ history
-│   │   └── query.py          # DuckDB read repository
+│   │   ├── query.py          # DuckDB read repository (provider-aware)
+│   │   └── reader.py         # SourceResolvingReader implements MarketDataReader
 │   ├── validation/
 │   │   ├── validator.py      # checks, severities, quarantine split
 │   │   └── audit.py          # full-history audit over the store
@@ -84,10 +108,15 @@ Verified reachable from this machine on 2026-10-19 (no keys needed): Binance spo
 and USD-M futures, Binance.US, Bybit, OKX, Coinbase Exchange, Kraken (spot and
 futures), Deribit, Hyperliquid.
 
+MVP universe: **BTC-USDT, ETH-USDT, SOL-USDT**. The MVP depends on **one** provider
+(Binance). OHLCV is ingested by default; derivatives are opt-in.
+
 | Provider | Use | Notes |
 |---|---|---|
-| **Binance (primary, Phase 1)** | OHLCV spot + perp, taker-buy volume, funding history, OI history | Deepest free history. OI history is limited to **~30 days** by the API, so OI accumulates locally from when you start ingesting. |
-| Bybit / OKX (Phase 2+ candidates) | Second source for cross-checks; longer OI history | Same interface, new adapter only |
+| **Binance (primary)** | OHLCV spot + perp, taker-buy volume; opt-in funding and OI | Deepest free history. OI history is limited to **~30 days** by the API, so OI accumulates locally from when you start ingesting. |
+| **CoinGecko (implemented, secondary)** | USD index OHLC, cross-checks | Keyless public tier: a few calls/min, `days` must be one of a fixed set, 4h candles for ≤30 days, candle timestamps are close times, **no volume**. Stored as `market=index`. |
+| Liquidations (planned 1.2) | Long squeezes, liquidation cascades | Binance removed historical REST (`allForceOrders`); free data is **WebSocket only** (`!forceOrder@arr`, which sends one sample per symbol per second). Needs an always-on collector. Paid aggregators (e.g. CoinGlass) are excluded. |
+| Bybit / OKX (candidates) | Second source for cross-checks; longer OI history | Same interface, new adapter only |
 | Coinbase / Kraken | US-regulated spot reference prices | For cross-venue outlier verification |
 | Deribit | Options and basis data | Later |
 

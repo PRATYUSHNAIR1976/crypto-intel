@@ -12,7 +12,8 @@ import pandas as pd
 from cryptointel.config import Settings, get_settings
 from cryptointel.domain.models import Dataset, Interval, Market, normalize_symbol
 from cryptointel.ingestion.pipeline import IngestionJob, IngestionPipeline, IngestionReport
-from cryptointel.providers.binance import BinanceProvider
+from cryptointel.providers.base import MarketDataProvider
+from cryptointel.providers.registry import PROVIDER_NAMES, build_provider
 from cryptointel.storage.catalog import Catalog
 from cryptointel.storage.parquet_store import ParquetStore, QuarantineStore
 from cryptointel.storage.query import MarketDataRepository
@@ -30,18 +31,25 @@ def _parse_date(value: str) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def build_jobs(symbols: list[str], markets: list[Market], intervals: list[Interval],
+def build_jobs(provider: MarketDataProvider, symbols: list[str], markets: list[Market], intervals: list[Interval],
                datasets: list[Dataset], start: datetime) -> list[IngestionJob]:
+    """One job per (symbol, dataset, market, interval) combination the provider actually supports."""
     jobs: list[IngestionJob] = []
     for symbol in symbols:
-        if Dataset.OHLCV in datasets:
-            jobs += [IngestionJob(Dataset.OHLCV, symbol, m, i, start) for m in markets for i in intervals]
-        if Market.PERP in markets:
-            if Dataset.FUNDING in datasets:
-                jobs.append(IngestionJob(Dataset.FUNDING, symbol, Market.PERP, None, start))
-            if Dataset.OPEN_INTEREST in datasets:
-                jobs += [IngestionJob(Dataset.OPEN_INTEREST, symbol, Market.PERP, i, start) for i in intervals]
+        for dataset in datasets:
+            for market in markets:
+                for interval in ([None] if dataset is Dataset.FUNDING else intervals):
+                    if provider.supports(dataset, market, interval):
+                        jobs.append(IngestionJob(dataset, symbol, market, interval, start))
     return jobs
+
+
+def _resolve_option(cli_value: str | None, defaults: list[str], enum, supported) -> list:
+    """Explicit CLI value wins; else configured defaults the provider supports; else everything it supports."""
+    if cli_value:
+        return [enum(v) for v in _csv(cli_value)]
+    preferred = [enum(v) for v in defaults if supported(enum(v))]
+    return preferred or [v for v in enum if supported(v)]
 
 
 def _print_reports(reports: list[IngestionReport]) -> None:
@@ -56,22 +64,25 @@ def _print_reports(reports: list[IngestionReport]) -> None:
 
 
 def cmd_ingest(args: argparse.Namespace, settings: Settings) -> int:
+    provider = build_provider(args.provider, settings)
     symbols = [normalize_symbol(s) for s in (_csv(args.symbols) or settings.symbols)]
-    markets = [Market(m) for m in (_csv(args.markets) or settings.markets)]
-    intervals = [Interval(i) for i in (_csv(args.intervals) or settings.intervals)]
-    datasets = [Dataset(d) for d in (_csv(args.datasets) or [d.value for d in Dataset])]
+    datasets = [Dataset(d) for d in (_csv(args.datasets) or settings.datasets)]
+    markets = _resolve_option(args.markets, settings.markets, Market,
+                              lambda m: any(provider.supports(d, m) for d in datasets))
+    intervals = _resolve_option(args.intervals, settings.intervals, Interval,
+                                lambda i: any(provider.supports(d, m, i) for d in datasets for m in markets))
     start = _parse_date(args.since or settings.history_start)
 
-    provider = BinanceProvider(
-        spot_base_url=settings.binance_spot_base_url, futures_base_url=settings.binance_futures_base_url,
-        timeout=settings.http_timeout_seconds, request_pause_seconds=settings.request_pause_seconds,
-        max_attempts=settings.retry_max_attempts,
-    )
+    jobs = build_jobs(provider, symbols, markets, intervals, datasets, start)
+    if not jobs:
+        print(f"Nothing to do: {provider.name} supports none of datasets={[d.value for d in datasets]} "
+              f"markets={[m.value for m in markets]} intervals={[i.value for i in intervals]}.")
+        return 0
     pipeline = IngestionPipeline(
         provider, RawStore(settings.raw_dir), ParquetStore(settings.normalized_dir),
         QuarantineStore(settings.quarantine_dir), Catalog(settings.catalog_path), incremental=not args.full_refresh,
     )
-    reports = pipeline.run_all(build_jobs(symbols, markets, intervals, datasets, start))
+    reports = pipeline.run_all(jobs)
     _print_reports(reports)
     return 1 if any(r.status == "failed" for r in reports) else 0
 
@@ -115,10 +126,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("ingest", help="Fetch market data incrementally into the local store")
+    p.add_argument("--provider", choices=PROVIDER_NAMES, default="binance")
     p.add_argument("--symbols", help="e.g. BTC-USDT,ETH-USDT (default from .env)")
-    p.add_argument("--markets", help="spot,perp")
-    p.add_argument("--intervals", help="15m,1h,4h,1d")
-    p.add_argument("--datasets", help="ohlcv,funding,open_interest")
+    p.add_argument("--markets", help="spot,perp,index (default: configured markets the provider supports)")
+    p.add_argument("--intervals", help="15m,1h,4h,1d (default: configured intervals the provider supports)")
+    p.add_argument("--datasets", help="ohlcv,funding,open_interest (default from .env: ohlcv)")
     p.add_argument("--since", help="ISO date, e.g. 2024-01-01")
     p.add_argument("--full-refresh", action="store_true", help="Ignore stored data and re-fetch from --since")
     p.set_defaults(func=cmd_ingest)

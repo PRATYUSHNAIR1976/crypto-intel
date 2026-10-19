@@ -4,15 +4,15 @@ import pandas as pd
 
 from cryptointel.domain.models import Dataset, Interval, Market
 from cryptointel.ingestion.pipeline import IngestionJob, IngestionPipeline
-from cryptointel.providers.base import FetchResult, MarketDataProvider, RawPage
+from cryptointel.providers.base import FetchResult, MarketDataProvider, OHLCVSource, RawPage
 from cryptointel.storage.catalog import Catalog
 from cryptointel.storage.parquet_store import ParquetStore, QuarantineStore
 from cryptointel.storage.raw import RawStore
 from tests.conftest import NOW, T0, ohlcv_frame
 
 
-class FakeProvider(MarketDataProvider):
-    """Serves a fixed in-memory OHLCV history; records requested windows."""
+class FakeProvider(MarketDataProvider, OHLCVSource):
+    """OHLCV-only provider serving a fixed in-memory history; records requested windows."""
 
     name = "binance"
 
@@ -21,7 +21,7 @@ class FakeProvider(MarketDataProvider):
         self.fail = fail
         self.requests: list[tuple] = []
 
-    def supports(self, dataset, market):
+    def supports(self, dataset, market, interval=None):
         return dataset is Dataset.OHLCV
 
     def fetch_ohlcv(self, symbol, market, interval, start, end):
@@ -31,12 +31,6 @@ class FakeProvider(MarketDataProvider):
         rows = self.history[(self.history["ts"] >= start) & (self.history["ts"] <= end)]
         page = RawPage("fake://klines", {"start": str(start)}, 200, NOW, rows.to_dict("records"))
         return FetchResult(Dataset.OHLCV, rows.copy(), [page])
-
-    def fetch_funding_rates(self, *a):
-        raise NotImplementedError
-
-    def fetch_open_interest(self, *a):
-        raise NotImplementedError
 
 
 def build(tmp_path, provider, clock=lambda: NOW):
@@ -100,9 +94,26 @@ def test_provider_failure_is_recorded_not_raised(tmp_path):
 
 
 def test_unsupported_dataset_is_skipped(tmp_path):
-    pipe, _, _ = build(tmp_path, FakeProvider(ohlcv_frame(5)))
+    provider = FakeProvider(ohlcv_frame(5))
+    assert provider.capabilities() == {Dataset.OHLCV}
+    pipe, _, _ = build(tmp_path, provider)
     report = pipe.run(IngestionJob(Dataset.FUNDING, "BTC-USDT", Market.PERP, None, T0))
     assert report.status == "unsupported"
+
+
+def test_build_jobs_only_creates_supported_combinations():
+    from cryptointel.cli import build_jobs
+    from cryptointel.providers.binance import BinanceProvider
+    from cryptointel.providers.coingecko import CoinGeckoProvider
+
+    all_markets, intervals = list(Market), [Interval.H1, Interval.H4]
+    binance = build_jobs(BinanceProvider(), ["BTC-USDT"], all_markets, intervals, list(Dataset), T0)
+    assert {(j.dataset, j.market) for j in binance} == {
+        (Dataset.OHLCV, Market.SPOT), (Dataset.OHLCV, Market.PERP),
+        (Dataset.FUNDING, Market.PERP), (Dataset.OPEN_INTEREST, Market.PERP)}
+
+    coingecko = build_jobs(CoinGeckoProvider(), ["BTC-USDT"], all_markets, intervals, list(Dataset), T0)
+    assert [(j.dataset, j.market, j.interval) for j in coingecko] == [(Dataset.OHLCV, Market.INDEX, Interval.H4)]
 
 
 def test_full_audit_detects_boundary_gap(tmp_path):

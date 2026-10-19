@@ -23,7 +23,7 @@ SCHEMAS: dict[Dataset, dict[str, str]] = {
         "high": "float64",
         "low": "float64",
         "close": "float64",
-        "volume": "float64",  # base-asset volume
+        "volume": "float64",  # base-asset volume; null when the source has none (index data)
         "quote_volume": "float64",
         "trade_count": "Int64",
         "taker_buy_volume": "float64",  # base volume from aggressive buyers (input for CVD later)
@@ -58,7 +58,7 @@ PRIMARY_KEYS: dict[Dataset, list[str]] = {
 }
 
 REQUIRED_NON_NULL: dict[Dataset, list[str]] = {
-    Dataset.OHLCV: ["ts", "open", "high", "low", "close", "volume"],
+    Dataset.OHLCV: ["ts", "open", "high", "low", "close"],
     Dataset.FUNDING: ["ts", "funding_rate"],
     Dataset.OPEN_INTEREST: ["ts", "open_interest"],
 }

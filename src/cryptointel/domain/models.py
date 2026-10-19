@@ -9,6 +9,7 @@ from enum import StrEnum
 class Market(StrEnum):
     SPOT = "spot"
     PERP = "perp"  # USD-margined perpetual futures
+    INDEX = "index"  # cross-exchange aggregated price (e.g. CoinGecko); never mixed with exchange series
 
 
 class Dataset(StrEnum):

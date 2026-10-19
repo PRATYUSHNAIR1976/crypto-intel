@@ -43,17 +43,32 @@ class MarketDataRepository:
                f"ORDER BY ts DESC LIMIT ?) ORDER BY ts")
         return self.query(sql, params)
 
+    def providers_for(self, dataset: Dataset, filters: dict[str, str]) -> set[str]:
+        """Providers that hold data for the series described by ``filters``."""
+        source = self._source(dataset)
+        if source is None:
+            return set()
+        where = " AND ".join(f"{col} = ?" for col in filters)
+        df = self.query(f"SELECT DISTINCT provider FROM {source} WHERE {where}", list(filters.values()))
+        return set(df["provider"])
+
+    @staticmethod
+    def _with_provider(filters: dict[str, str], provider: str | None) -> dict[str, str]:
+        return {**filters, "provider": provider} if provider else filters
+
     def candles(self, symbol: str, market: str, interval: str, start: datetime | None = None,
-                end: datetime | None = None, limit: int = 1000) -> pd.DataFrame:
-        return self._series(Dataset.OHLCV, {"symbol": symbol, "market": market, "interval": interval}, start, end, limit)
+                end: datetime | None = None, limit: int = 1000, provider: str | None = None) -> pd.DataFrame:
+        filters = {"symbol": symbol, "market": market, "interval": interval}
+        return self._series(Dataset.OHLCV, self._with_provider(filters, provider), start, end, limit)
 
     def funding(self, symbol: str, start: datetime | None = None, end: datetime | None = None,
-                limit: int = 1000) -> pd.DataFrame:
-        return self._series(Dataset.FUNDING, {"symbol": symbol}, start, end, limit)
+                limit: int = 1000, provider: str | None = None) -> pd.DataFrame:
+        return self._series(Dataset.FUNDING, self._with_provider({"symbol": symbol}, provider), start, end, limit)
 
     def open_interest(self, symbol: str, interval: str, start: datetime | None = None,
-                      end: datetime | None = None, limit: int = 1000) -> pd.DataFrame:
-        return self._series(Dataset.OPEN_INTEREST, {"symbol": symbol, "interval": interval}, start, end, limit)
+                      end: datetime | None = None, limit: int = 1000, provider: str | None = None) -> pd.DataFrame:
+        filters = {"symbol": symbol, "interval": interval}
+        return self._series(Dataset.OPEN_INTEREST, self._with_provider(filters, provider), start, end, limit)
 
     def summary(self) -> pd.DataFrame:
         parts = []

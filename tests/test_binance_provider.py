@@ -136,6 +136,8 @@ def test_supports_matrix():
     from cryptointel.domain.models import Dataset
 
     p = make_provider(lambda r: httpx.Response(200, json=[]))
+    assert p.capabilities() == {Dataset.OHLCV, Dataset.FUNDING, Dataset.OPEN_INTEREST}
     assert p.supports(Dataset.OHLCV, Market.SPOT)
     assert p.supports(Dataset.FUNDING, Market.PERP)
     assert not p.supports(Dataset.FUNDING, Market.SPOT)
+    assert not p.supports(Dataset.OHLCV, Market.INDEX)

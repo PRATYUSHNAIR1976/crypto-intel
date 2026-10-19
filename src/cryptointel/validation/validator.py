@@ -142,6 +142,11 @@ def validate(
 
     # --- WARNING checks on clean data (reported, rows kept)
     if dataset is Dataset.OHLCV:
+        no_volume = clean["volume"].isna()
+        if no_volume.any():
+            issues.append(QualityIssue("missing_volume", Severity.WARNING, int(no_volume.sum()),
+                                       "Source provides no volume for these candles (volume-based features unavailable).",
+                                       _sample(clean.loc[no_volume, "ts"])))
         zero = clean["volume"] == 0
         if zero.any():
             issues.append(QualityIssue("zero_volume", Severity.WARNING, int(zero.sum()),

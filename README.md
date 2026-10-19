@@ -24,10 +24,30 @@ cp .env.example .env              # no API keys needed for Phase 1
 Useful ingest options:
 
 ```bash
+cip ingest                                   # OHLCV from Binance (default)
+cip ingest --datasets funding,open_interest  # derivatives, opt-in
+cip ingest --provider coingecko              # USD index, 4h, last 30 days (cross-check source)
 cip ingest --symbols BTC-USDT --markets perp --intervals 15m --since 2025-01-01
-cip ingest --datasets funding,open_interest
-cip ingest --full-refresh         # re-fetch from --since; upsert dedupes
+cip ingest --full-refresh                    # re-fetch from --since; upsert dedupes
 ```
+
+## Providers and source independence
+
+```
+MarketDataProvider          identity + supports()
+  ├── OHLCVSource            fetch_ohlcv
+  ├── FundingSource          fetch_funding_rates
+  └── OpenInterestSource     fetch_open_interest
+
+BinanceProvider   = OHLCV + Funding + OpenInterest   (spot, perp)
+CoinGeckoProvider = OHLCV                            (index, 4h, no volume)
+```
+
+Everything downstream of storage reads through one port, `MarketDataReader`. It
+picks **one** provider per series (`CIP_SOURCE_PRIORITY`) and returns frames
+**without** `provider`/`ingested_at` columns, so analytics and strategy code can't
+know where data came from. `tests/test_architecture.py` fails the build if
+strategy-side packages import providers, storage, ingestion, HTTP or database clients.
 
 ## Pipeline
 
@@ -44,7 +64,8 @@ Gaps are never filled.
 
 | Check | Severity |
 |---|---|
-| null/unparseable required field, future or misaligned timestamp | error |
+| null/unparseable OHLC or timestamp, future or misaligned timestamp | error |
+| volume not provided by source (e.g. index data) | warning |
 | price ≤ 0, negative volume, high/low not bounding open/close, taker volume > volume | error |
 | negative open interest | error |
 | duplicate keys (last wins), missing intervals, zero volume, extreme funding, price outliers (robust z > 12) | warning |
@@ -59,10 +80,16 @@ Gaps are never filled.
 
 ## Data sources and limits
 
-- Binance spot and USD-M perpetual public endpoints, no key required.
-- Open-interest history is limited to **~30 days** by Binance. Run `cip ingest`
-  regularly and the local history grows from there.
-- Check the provider's terms of use for your jurisdiction.
+- **Binance** spot and USD-M perpetual public endpoints, no key required.
+  Open-interest history is limited to **~30 days**. Run `cip ingest` regularly and
+  the local history grows from there.
+- **CoinGecko** public API, no key required (a free Demo key raises the rate limit).
+  It provides a cross-exchange USD index (USDT/USDC treated as USD), 4h candles for the
+  last 30 days, and no volume. It's stored as `market=index`, for cross-checks only.
+  The keyless tier allows only a few calls per minute.
+- **Liquidations** are not yet supported. Free sources are real-time WebSocket only
+  (no historical REST), so they need an always-on collector (planned).
+- Check each provider's terms of use for your jurisdiction.
 
 ## Principles
 

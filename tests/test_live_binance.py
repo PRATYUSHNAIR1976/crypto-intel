@@ -30,6 +30,16 @@ def test_live_funding_contract(provider):
     assert len(frame) >= 3 and frame["funding_rate"].abs().max() < 0.03
 
 
+def test_live_coingecko_ohlc_contract():
+    from cryptointel.providers.coingecko import CoinGeckoProvider
+
+    end = utc_now()
+    frame = CoinGeckoProvider().fetch_ohlcv("BTC-USDT", Market.INDEX, Interval.H4, end - timedelta(days=5), end).frame
+    assert len(frame) >= 25
+    assert (frame["ts"].astype("int64") // 1_000_000 % Interval.H4.ms == 0).all()
+    assert not validate(frame, Dataset.OHLCV, Interval.H4).has_errors
+
+
 def test_live_open_interest_contract(provider):
     end = utc_now()
     frame = provider.fetch_open_interest("BTC-USDT", Interval.H1, end - timedelta(hours=6), end).frame

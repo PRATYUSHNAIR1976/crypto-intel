@@ -10,9 +10,8 @@ Endpoints used:
 from __future__ import annotations
 
 import logging
-import time
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from typing import Callable
 
 import httpx
 import pandas as pd
@@ -21,12 +20,12 @@ from cryptointel.domain.models import Dataset, Interval, Market, utc_now
 from cryptointel.domain.schemas import coerce, empty_frame
 from cryptointel.providers.base import (
     FetchResult,
+    FundingSource,
     MarketDataProvider,
-    ProviderError,
-    RawPage,
-    RetryableProviderError,
+    OHLCVSource,
+    OpenInterestSource,
 )
-from cryptointel.retry import retry_on_exception
+from cryptointel.providers.http import JsonHttpClient
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +39,14 @@ def _to_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
-class BinanceProvider(MarketDataProvider):
+class BinanceProvider(MarketDataProvider, OHLCVSource, FundingSource, OpenInterestSource):
     name = "binance"
+
+    _MARKETS = {
+        Dataset.OHLCV: {Market.SPOT, Market.PERP},
+        Dataset.FUNDING: {Market.PERP},
+        Dataset.OPEN_INTEREST: {Market.PERP},
+    }
 
     KLINE_LIMIT = 1000
     FUNDING_LIMIT = 1000
@@ -60,53 +65,21 @@ class BinanceProvider(MarketDataProvider):
         backoff_seconds: float = 1.0,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
-        self._client = client or httpx.Client(
-            timeout=timeout, headers={"User-Agent": "crypto-intel/0.1 (local research)"}
-        )
         self._spot = spot_base_url.rstrip("/")
         self._futures = futures_base_url.rstrip("/")
-        self._pause = request_pause_seconds
         self._clock = clock
-        self._get = retry_on_exception(
-            max_attempts=max_attempts,
-            initial_delay=backoff_seconds,
-            allowed_exceptions=(RetryableProviderError,),
-        )(self._get_once)
-
-    # ------------------------------------------------------------------ http
-    def _get_once(self, url: str, params: dict[str, Any]) -> RawPage:
-        try:
-            resp = self._client.get(url, params=params)
-        except httpx.TransportError as exc:
-            raise RetryableProviderError(f"{url}: {exc!r}") from exc
-
-        if resp.status_code == 429:
-            wait = min(float(resp.headers.get("Retry-After", 1) or 0), 60.0)
-            logger.warning("Rate limited by Binance; sleeping %.1fs", wait)
-            time.sleep(wait)
-            raise RetryableProviderError(f"{url}: HTTP 429 rate limited")
-        if resp.status_code >= 500:
-            raise RetryableProviderError(f"{url}: HTTP {resp.status_code}")
-        if resp.status_code == 418:
-            raise ProviderError("Binance returned 418 (IP auto-banned for ignoring rate limits). Back off.")
-        if resp.status_code == 451:
-            raise ProviderError("Binance returned 451 (unavailable from this region). Configure another provider.")
-        if resp.status_code >= 400:
-            raise ProviderError(f"{url} {params} -> HTTP {resp.status_code}: {resp.text[:300]}")
-
-        page = RawPage(
-            url=url, params=dict(params), status_code=resp.status_code,
-            fetched_at=self._clock(), payload=resp.json(),
-        )
-        if self._pause:
-            time.sleep(self._pause)
-        return page
+        self._get = JsonHttpClient(
+            self.name, client=client, timeout=timeout, request_pause_seconds=request_pause_seconds,
+            max_attempts=max_attempts, backoff_seconds=backoff_seconds, clock=clock,
+            fail_fast_messages={
+                418: "IP auto-banned for ignoring rate limits. Back off.",
+                451: "unavailable from this region. Configure another provider.",
+            },
+        ).get
 
     # ------------------------------------------------------------ interface
-    def supports(self, dataset: Dataset, market: Market) -> bool:
-        if dataset is Dataset.OHLCV:
-            return market in (Market.SPOT, Market.PERP)
-        return market is Market.PERP
+    def supports(self, dataset: Dataset, market: Market, interval: Interval | None = None) -> bool:
+        return market in self._MARKETS.get(dataset, set())
 
     @staticmethod
     def to_exchange_symbol(symbol: str) -> str:
