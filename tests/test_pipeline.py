@@ -6,7 +6,7 @@ from cryptointel.domain.models import Dataset, Interval, Market
 from cryptointel.ingestion.pipeline import IngestionJob, IngestionPipeline
 from cryptointel.providers.base import FetchResult, MarketDataProvider, OHLCVSource, RawPage
 from cryptointel.storage.catalog import Catalog
-from cryptointel.storage.parquet_store import ParquetStore, QuarantineStore
+from cryptointel.storage.parquet_store import ParquetStore, RejectedStore
 from cryptointel.storage.raw import RawStore
 from tests.conftest import NOW, T0, ohlcv_frame
 
@@ -34,9 +34,9 @@ class FakeProvider(MarketDataProvider, OHLCVSource):
 
 
 def build(tmp_path, provider, clock=lambda: NOW):
-    store = ParquetStore(tmp_path / "normalized")
+    store = ParquetStore(tmp_path / "processed")
     catalog = Catalog(tmp_path / "catalog.sqlite")
-    pipe = IngestionPipeline(provider, RawStore(tmp_path / "raw"), store, QuarantineStore(tmp_path / "quarantine"),
+    pipe = IngestionPipeline(provider, RawStore(tmp_path / "raw"), store, RejectedStore(tmp_path / "rejected"),
                              catalog, clock=clock)
     return pipe, store, catalog
 
@@ -44,21 +44,31 @@ def build(tmp_path, provider, clock=lambda: NOW):
 JOB = IngestionJob(Dataset.OHLCV, "BTC-USDT", Market.SPOT, Interval.H1, T0)
 
 
-def test_end_to_end_ingest_with_quarantine(tmp_path):
+def test_end_to_end_raw_validated_rejected_are_separate(tmp_path):
     history = ohlcv_frame(24)
     history.loc[5, "close"] = None  # one corrupt candle
     pipe, store, catalog = build(tmp_path, FakeProvider(history))
 
     report = pipe.run(JOB)
 
-    assert report.status == "success_with_quarantine"
-    assert (report.rows_fetched, report.rows_written, report.rows_quarantined) == (24, 23, 1)
+    assert report.status == "success_with_rejections"
+    assert (report.rows_fetched, report.rows_written, report.rows_rejected) == (24, 23, 1)
+    # raw: everything as received (24 rows incl. the bad one)
+    from cryptointel.storage.raw import RawStore as _Raw
+    raw_doc = _Raw.read(next((tmp_path / "raw").rglob("*.json.gz")))
+    assert len(raw_doc["pages"][0]["payload"]) == 24
+    # validated
     assert len(store.read(Dataset.OHLCV, "binance", "spot", "BTC-USDT", "1h")) == 23
-    assert list((tmp_path / "quarantine" / "ohlcv").glob("*.parquet"))
-    assert list((tmp_path / "raw").rglob("*.json.gz"))
+    # rejected, with the reason
+    rejected = pd.read_parquet(tmp_path / "rejected" / "ohlcv" / f"{report.run_id}.parquet")
+    assert list(rejected["dq_reason"]) == ["null_values"] and rejected["close"].isna().all()
+    # report: every check recorded, including passes
     run = catalog.recent_runs()[0]
-    assert run["run_id"] == report.run_id and run["status"] == "success_with_quarantine"
-    assert {i["check_name"] for i in catalog.issues(run_id=report.run_id)} >= {"null_close", "missing_intervals"}
+    assert run["run_id"] == report.run_id and run["status"] == "success_with_rejections"
+    rows = catalog.dq_report(run_id=report.run_id)
+    assert len(rows) == len(report.checks) and {"pass", "fail", "warn"} <= {r["status"] for r in rows}
+    null_row = next(r for r in rows if r["check_name"] == "null_values")
+    assert (null_row["failed_rows"], null_row["total_rows"], null_row["timeframe"]) == (1, 24, "1h")
 
 
 def test_incremental_run_resumes_after_latest_stored_candle(tmp_path):
@@ -121,7 +131,9 @@ def test_full_audit_detects_boundary_gap(tmp_path):
 
     store = ParquetStore(tmp_path)
     store.upsert(Dataset.OHLCV, ohlcv_frame(48).drop(index=range(10, 13)))
-    audits = audit_store(store)
-    assert len(audits) == 1
-    gap = [i for i in audits[0].issues if i.check == "missing_intervals"][0]
-    assert gap.affected_rows == 3 and audits[0].rows == 45
+    audits, rows = audit_store(store, now=NOW)
+    assert len(audits) == 1 and audits[0].result.input_rows == 45
+    missing = audits[0].result.check("missing_timestamps")
+    assert missing.failed_rows == 3 and missing.total_rows == 48
+    assert audits[0].result.check("timestamp_gaps").failed_rows == 3
+    assert {r["scope"] for r in rows} == {"audit"} and "incomplete_candle" not in {r["check_name"] for r in rows}

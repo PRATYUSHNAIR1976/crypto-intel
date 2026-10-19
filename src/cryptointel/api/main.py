@@ -75,9 +75,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/v1/data-quality")
     def data_quality(run_id: str | None = None, scope: str | None = Query(None, pattern="^(ingest|audit)$"),
-                     symbol: str | None = None, min_severity: str | None = Query(None, pattern="^(warning|error)$"),
+                     symbol: str | None = None,
+                     status: list[str] | None = Query(None, description="pass | info | warn | fail (repeatable)"),
+                     min_severity: str | None = Query(None, pattern="^(warning|error)$"),
                      limit: int = Query(200, ge=1, le=5000)) -> list[dict]:
-        return catalog.issues(run_id=run_id, scope=scope, symbol=_symbol(symbol) if symbol else None,
-                              min_severity=min_severity, limit=limit)
+        """DQ report rows (one per series x check). Defaults to non-passing checks."""
+        if status and not set(status) <= {"pass", "info", "warn", "fail"}:
+            raise HTTPException(status_code=422, detail="status must be pass, info, warn or fail")
+        return catalog.dq_report(run_id=run_id, scope=scope, symbol=_symbol(symbol) if symbol else None,
+                                 statuses=status or ["info", "warn", "fail"], min_severity=min_severity, limit=limit)
 
     return app

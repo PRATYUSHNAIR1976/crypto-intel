@@ -72,8 +72,8 @@ def test_output_validates_cleanly():
     frame = make_provider(fake_exchange(48)).fetch_ohlcv(
         "BTC-USDT", Market.SPOT, Interval.H1, T0, T0 + timedelta(hours=47)).frame
     result = validate(frame, Dataset.OHLCV, Interval.H1, now=NOW)
-    assert not result.has_errors and len(result.clean) == 48
-    assert [i.check for i in result.issues if i.severity is not Severity.INFO] == []
+    assert not result.has_errors and len(result.validated) == 48
+    assert [c.check_name for c in result.issues if c.severity is not Severity.INFO] == []
 
 
 @pytest.mark.parametrize("market,interval", [(Market.PERP, Interval.H1), (Market.INDEX, Interval.H1)])

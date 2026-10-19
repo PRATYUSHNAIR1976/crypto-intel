@@ -69,8 +69,8 @@ def test_output_validates_with_only_volume_warning():
     frame = make_provider(lambda r: httpx.Response(200, json=cg_rows(6))).fetch_ohlcv(
         "BTC-USDT", Market.INDEX, Interval.H4, NOW - timedelta(days=3), NOW).frame
     result = validate(frame, Dataset.OHLCV, Interval.H4, now=NOW)
-    assert not result.has_errors and len(result.clean) == 6
-    assert {i.check for i in result.issues if i.severity is not Severity.INFO} == {"missing_volume"}
+    assert not result.has_errors and len(result.validated) == 6
+    assert {c.check_name for c in result.issues if c.severity is not Severity.INFO} == {"missing_volume"}
 
 
 @pytest.mark.parametrize("market,interval", [(Market.SPOT, Interval.H4), (Market.INDEX, Interval.H1)])

@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     request_pause_seconds: float = 0.15
     retry_max_attempts: int = 4
 
+    # Optional TOML overriding the packaged data-quality rules (validation/dq_rules.toml)
+    dq_rules_path: Path | None = None
+
     log_level: str = "INFO"
     log_format: Literal["json", "text"] = "json"
 
@@ -60,8 +63,13 @@ class Settings(BaseSettings):
         return self.data_dir / "processed"
 
     @property
-    def quarantine_dir(self) -> Path:
-        return self.data_dir / "quarantine"
+    def rejected_dir(self) -> Path:
+        """Rows that failed validation, with reasons (never silently discarded)."""
+        return self.data_dir / "rejected"
+
+    @property
+    def reports_dir(self) -> Path:
+        return self.data_dir / "reports"
 
     @property
     def catalog_path(self) -> Path:

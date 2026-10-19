@@ -1,4 +1,4 @@
-"""Ingestion pipeline: fetch -> raw landing -> validate -> normalized store -> catalog.
+"""Ingestion pipeline: fetch -> raw landing -> validate -> processed + rejected stores -> DQ report.
 
 Incremental by default: each job resumes from the latest stored timestamp.
 A failing job is recorded and reported; it never aborts the other jobs.
@@ -22,9 +22,11 @@ from cryptointel.providers.base import (
     ProviderError,
 )
 from cryptointel.storage.catalog import Catalog
-from cryptointel.storage.parquet_store import ParquetStore, QuarantineStore
+from cryptointel.storage.parquet_store import ParquetStore, RejectedStore
 from cryptointel.storage.raw import RawStore
-from cryptointel.validation.validator import QualityIssue, validate
+from cryptointel.validation.report import report_rows
+from cryptointel.validation.rules import DQConfig, default_dq_config
+from cryptointel.validation.validator import CheckResult, Status, validate
 
 logger = logging.getLogger(__name__)
 
@@ -50,24 +52,31 @@ class IngestionReport:
     effective_start: datetime | None = None
     rows_fetched: int = 0
     rows_written: int = 0
-    rows_quarantined: int = 0
-    rows_dropped: int = 0
+    rows_rejected: int = 0
+    rows_dropped: int = 0  # excluded for non-quality reasons (still-open candles); also in rejected/
     quality_score: float | None = None
-    issues: list[QualityIssue] = field(default_factory=list)
+    checks: list[CheckResult] = field(default_factory=list)
     raw_path: str | None = None
     error: str | None = None
 
+    @property
+    def issues(self) -> list[CheckResult]:
+        return [c for c in self.checks if c.status is not Status.PASS]
+
 
 class IngestionPipeline:
+    """raw/ (as received) -> validate -> processed/ (validated) + rejected/ (with reasons) + DQ report."""
+
     def __init__(self, provider: MarketDataProvider, raw_store: RawStore, store: ParquetStore,
-                 quarantine: QuarantineStore, catalog: Catalog, *, incremental: bool = True,
-                 clock: Callable[[], datetime] = utc_now) -> None:
+                 rejected: RejectedStore, catalog: Catalog, *, incremental: bool = True,
+                 dq_config: DQConfig | None = None, clock: Callable[[], datetime] = utc_now) -> None:
         self.provider = provider
         self.raw_store = raw_store
         self.store = store
-        self.quarantine = quarantine
+        self.rejected = rejected
         self.catalog = catalog
         self.incremental = incremental
+        self.dq_config = dq_config or default_dq_config()
         self._clock = clock
 
     def _resolve_start(self, job: IngestionJob) -> datetime:
@@ -119,14 +128,17 @@ class IngestionPipeline:
             report.rows_fetched = len(result.frame)
             report.raw_path = str(self.raw_store.write(run_id=run_id, pages=result.pages, **meta))
 
-            validation = validate(result.frame, job.dataset, job.interval, now=now)
-            report.rows_written = self.store.upsert(job.dataset, validation.clean)
-            self.quarantine.write(job.dataset, validation.quarantined, run_id)
-            report.rows_quarantined = len(validation.quarantined)
-            report.rows_dropped = validation.dropped_rows
+            validation = validate(result.frame, job.dataset, job.interval, now=now, config=self.dq_config)
+            report.rows_written = self.store.upsert(job.dataset, validation.validated)
+            self.rejected.write(job.dataset, validation.rejected, run_id)
+            report.rows_rejected = len(validation.rejected)
+            report.rows_dropped = validation.excluded_rows
             report.quality_score = validation.quality_score
-            report.issues = validation.issues
-            report.status = "success_with_quarantine" if validation.has_errors else "success"
+            report.checks = validation.checks
+            report.status = "success_with_rejections" if validation.has_errors else "success"
+            self.catalog.record_dq_report(report_rows(
+                validation, run_timestamp=now, scope="ingest", run_id=run_id, dataset=meta["dataset"],
+                provider=meta["provider"], market=meta["market"], symbol=meta["symbol"], timeframe=interval))
         except Exception as exc:  # recorded, not swallowed: surfaces in catalog, CLI, API and logs
             report.status = "failed"
             report.error = f"{type(exc).__name__}: {exc}"
@@ -135,16 +147,16 @@ class IngestionPipeline:
 
         self.catalog.finish_run(
             run_id, status=report.status, rows_fetched=report.rows_fetched, rows_written=report.rows_written,
-            rows_quarantined=report.rows_quarantined, rows_dropped=report.rows_dropped,
+            rows_rejected=report.rows_rejected, rows_dropped=report.rows_dropped,
             quality_score=report.quality_score, raw_path=report.raw_path, error=report.error,
         )
-        self.catalog.record_issues(report.issues, scope="ingest", run_id=run_id, **meta)
         logger.info("ingestion finished", extra={
             "event": "ingest_finished", "run_id": run_id, **meta, "status": report.status,
             "rows_fetched": report.rows_fetched, "rows_written": report.rows_written,
-            "rows_quarantined": report.rows_quarantined, "rows_dropped": report.rows_dropped,
+            "rows_rejected": report.rows_rejected, "rows_dropped": report.rows_dropped,
             "quality_score": report.quality_score,
-            "warnings": [i.check for i in report.issues if i.severity == "warning"],
+            "failed_checks": [c.check_name for c in report.issues if c.status is Status.FAIL],
+            "warned_checks": [c.check_name for c in report.issues if c.status is Status.WARN],
         })
         return report
 

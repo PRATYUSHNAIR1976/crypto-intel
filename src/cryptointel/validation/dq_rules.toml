@@ -1,0 +1,103 @@
+# Default data-quality rules. Override any subset with your own TOML file and point
+# CIP_DQ_RULES_PATH at it; unknown check names or severities are rejected at load time.
+#
+# severity:
+#   "error"   -> failing ROWS are rejected (written to data/rejected with dq_reason); report status = fail
+#   "warning" -> rows are kept and reported;                                          report status = warn
+# Series-level checks (missing_timestamps, timestamp_gaps) never reject rows; severity only sets status.
+# Nothing is ever repaired: gaps are not filled, bad values are not corrected.
+
+[checks.null_values]
+enabled = true
+severity = "error"
+
+[checks.duplicate_timestamps]   # earlier copies of a duplicated key are always rejected; the last is kept
+enabled = true
+severity = "warning"
+
+[checks.future_timestamp]
+enabled = true
+severity = "error"
+
+[checks.misaligned_timestamp]
+enabled = true
+severity = "error"
+
+[checks.incomplete_candle]      # candle still open: excluded until it closes (re-fetched next run)
+enabled = true
+severity = "info"
+
+[checks.high_below_low]
+enabled = true
+severity = "error"
+
+[checks.high_below_open]
+enabled = true
+severity = "error"
+
+[checks.high_below_close]
+enabled = true
+severity = "error"
+
+[checks.low_above_open]
+enabled = true
+severity = "error"
+
+[checks.low_above_close]
+enabled = true
+severity = "error"
+
+[checks.negative_price]
+enabled = true
+severity = "error"
+
+[checks.zero_price]
+enabled = true
+severity = "error"
+
+[checks.negative_volume]
+enabled = true
+severity = "error"
+
+[checks.taker_volume_exceeds_volume]
+enabled = true
+severity = "error"
+
+[checks.extreme_price_jump]     # real crashes happen: flag, don't reject, by default
+enabled = true
+severity = "warning"
+
+[checks.zero_volume]
+enabled = true
+severity = "warning"
+
+[checks.missing_volume]
+enabled = true
+severity = "warning"
+
+[checks.extreme_funding_rate]
+enabled = true
+severity = "warning"
+
+[checks.missing_timestamps]
+enabled = true
+severity = "warning"
+
+[checks.timestamp_gaps]
+enabled = true
+severity = "warning"
+
+[params]
+# timestamp_gaps flags runs of consecutive missing candles LONGER than this many intervals
+max_gap_intervals = 1
+# |funding rate| per funding period above which extreme_funding_rate fires
+extreme_funding_rate = 0.03
+# future_timestamp tolerance for clock skew
+future_tolerance_seconds = 60
+
+# extreme_price_jump: |close / previous close - 1| above this, per timeframe
+[params.max_abs_return]
+15m = 0.10
+1h = 0.15
+4h = 0.25
+1d = 0.40

@@ -1,4 +1,4 @@
-"""Read-side repository: DuckDB SQL over the normalized Parquet lake."""
+"""Read-side repository: DuckDB SQL over the processed Parquet lake."""
 
 from __future__ import annotations
 

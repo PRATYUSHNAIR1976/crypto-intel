@@ -30,7 +30,7 @@ provider changes ingestion and configuration only, never analytics.
 
 | Phase | Scope | MVP items |
 |---|---|---|
-| **1 ✅** | Provider interface, Binance public adapter, raw landing, validation/quarantine, normalized Parquet, DuckDB query layer, SQLite catalog, CLI, read-only API | 1, 2, 3 |
+| **1 ✅** | Provider interface, Binance public adapter, raw landing, validation, processed Parquet, DuckDB query layer, SQLite catalog, CLI, read-only API | 1, 2, 3 |
 | **1.1 ✅** | Capability-based provider interfaces, CoinGecko adapter (2nd source), `MarketDataReader` port with one source per series, OHLCV-first default, architecture test | 1 |
 | **1.1b ✅** | CoinbaseProvider as secondary OHLCV source (replaces CoinGecko in that role; CoinGecko kept, lowest priority) | 1 |
 | 1.2 | Derivatives: Binance Vision bulk backfill (OI 5-min history since 2020-09, long/short ratios, funding) + liquidations WebSocket collector (Binance `!forceOrder@arr`; history only from first run) | — |
@@ -67,12 +67,14 @@ crypto-intel/
 │   │   └── registry.py       # build provider by name from settings
 │   ├── storage/
 │   │   ├── raw.py            # immutable gzipped raw payloads
-│   │   ├── parquet_store.py  # normalized series + quarantine
+│   │   ├── parquet_store.py  # processed series + rejected records
 │   │   ├── catalog.py        # SQLite lineage + DQ history
 │   │   ├── query.py          # DuckDB read repository (provider-aware)
 │   │   └── reader.py         # SourceResolvingReader implements MarketDataReader
 │   ├── validation/
-│   │   ├── validator.py      # checks, severities, quarantine split
+│   │   ├── validator.py      # configurable DQ checks; validated/rejected split
+│   │   ├── rules.py + dq_rules.toml  # rule config (enabled, severity, thresholds)
+│   │   ├── report.py         # DQ report rows
 │   │   └── audit.py          # full-history audit over the store
 │   ├── ingestion/pipeline.py # fetch → raw → validate → store → catalog
 │   ├── api/main.py           # FastAPI (read-only)
@@ -134,17 +136,19 @@ provider long term, check its terms of use for your jurisdiction.
 ```
 data/
 ├── raw/{provider}/{dataset}/{market}/{symbol}/{interval|all}/{YYYY-MM-DD}/{run_id}.json.gz
-├── normalized/{dataset}/provider=…/market=…/symbol=…/[interval=…/]data.parquet
-├── quarantine/{dataset}/{run_id}.parquet      # rows that failed ERROR checks + dq_reason
-└── catalog.sqlite                             # lineage + data-quality history
+├── processed/{dataset}/provider=…/market=…/symbol=…/[interval=…/]data.parquet
+├── rejected/{dataset}/{run_id}.parquet        # rejected rows + dq_reason + run_id
+├── reports/dq_report_<UTC>.csv                # full-history audit reports
+└── catalog.sqlite                             # lineage + DQ report
 ```
 
 - **Raw (bronze):** immutable, exactly as received, for replay and auditing.
-- **Normalized (silver):** canonical schema, validated, deduplicated, one file per
+- **Processed (silver):** canonical schema, validated rows only, one file per
   series, rewritten atomically. Hive-style paths keep the layout compatible with a
   later move to Delta Lake or Databricks.
-- **Quarantine:** bad rows are never silently dropped; each one keeps its reason.
-- **Features (gold, Phase 2):** `features/` Parquet derived only from normalized data.
+- **Rejected:** nothing is silently dropped. Every row that didn't reach `processed/`
+  is kept here with its reason, including superseded duplicates and still-open candles.
+- **Features (gold, Phase 2):** `features/` Parquet derived only from processed data.
 - **DuckDB** is used in-memory for SQL over Parquet. No database server, and no
   database file to keep in sync.
 - **SQLite** holds relational metadata: runs, DQ issues, and later signals and the journal.
@@ -153,8 +157,9 @@ data/
 
 **Implemented (SQLite `catalog.sqlite`):**
 
-- `ingestion_runs(run_id PK, provider, dataset, market, symbol, interval, requested_start, effective_start, requested_end, status, rows_fetched, rows_written, rows_quarantined, rows_dropped, quality_score, raw_path, error, started_at, finished_at)`
-- `data_quality_issues(id PK, run_id, scope[ingest|audit], provider, dataset, market, symbol, interval, check_name, severity, affected_rows, message, sample_json, created_at)`
+- `ingestion_runs(run_id PK, provider, dataset, market, symbol, interval, requested_start, effective_start, requested_end, status, rows_fetched, rows_written, rows_rejected, rows_dropped, quality_score, raw_path, error, started_at, finished_at)`
+- `dq_report(id PK, run_timestamp, run_id, scope[ingest|audit], dataset, provider, market, symbol, timeframe, check_name, severity, status[pass|info|warn|fail], failed_rows, total_rows, message, sample_json)`: one row per series × check, passes included
+- Catalogs from before Phase 1B are migrated automatically (`rows_quarantined` → `rows_rejected`). The legacy `data_quality_issues` table is left untouched as history.
 
 **Canonical Parquet schemas (implemented):**
 
@@ -202,7 +207,7 @@ Ingestion is CLI-only for now (`cip ingest`), which keeps write paths out of the
 ## H. Strategy-engine architecture (Phase 3)
 
 ```
-normalized data → features (pure functions, tested) → regime classifier (rules)
+processed data → features (pure functions, tested) → regime classifier (rules)
    → Rules: (features, params) → RuleResult{id, triggered, evidence{metric: value, threshold}}
    → Strategy = rule set + regime filter + scoring weights + invalidation + risk template (versioned, params in YAML)
    → Scanner runs strategies over the universe → Signal objects (schema in §E)
@@ -233,7 +238,7 @@ normalized data → features (pure functions, tested) → regime classifier (rul
 - **Provider:** `httpx.MockTransport` simulates pagination, rate limits (429), 5xx
   retries, fail-fast 4xx/418/451, malformed numbers, and the OI "latest rows" quirk.
 - **Pipeline:** a fake provider tests end-to-end ingestion, incremental resume,
-  up-to-date short-circuit, failure recording and quarantine.
+  up-to-date short-circuit, failure recording, and raw/processed/rejected separation.
 - **API:** FastAPI `TestClient` against a temp data dir, including a "no trading endpoints" test.
 - **Live contract tests** (`pytest -m live`, deselected by default): confirm Binance's
   real payloads still match our mapping.
@@ -244,7 +249,7 @@ normalized data → features (pure functions, tested) → regime classifier (rul
 
 | Item | Phase 1 measured | Later estimate |
 |---|---|---|
-| Disk: data (3 symbols × spot/perp × 1h/4h/1d since 2024 + funding + OI) | **27 MB** (13 raw + 14 normalized) | ~10 MB/symbol/year incl. raw; 15m interval ≈ 4× |
+| Disk: data (3 symbols × spot/perp × 1h/4h/1d since 2024 + funding + OI) | **27 MB** (13 raw + 14 processed; ~50 MB after adding Coinbase + CoinGecko) | ~10 MB/symbol/year incl. raw; 15m interval ≈ 4× |
 | Disk: virtualenv | ~350 MB | +300 MB with Streamlit/Plotly |
 | RAM: ingestion / API | < 300 MB | Streamlit +150–250 MB |
 | RAM: local LLM (Phase 6) | — | 2–2.5 GB (3B Q4) |

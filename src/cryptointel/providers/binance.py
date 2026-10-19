@@ -156,7 +156,7 @@ class BinanceProvider(MarketDataProvider, OHLCVSource, FundingSource, OpenIntere
 
     # -------------------------------------------------------------- mapping
     # Numeric fields use errors="coerce": malformed values become NaN and are
-    # then quarantined by validation instead of crashing ingestion.
+    # then rejected by validation (null_values) instead of crashing ingestion.
     def _klines_to_frame(self, rows, symbol, market, interval) -> pd.DataFrame:
         if not rows:
             return empty_frame(Dataset.OHLCV)

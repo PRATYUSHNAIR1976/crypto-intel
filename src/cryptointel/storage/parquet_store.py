@@ -1,6 +1,6 @@
-"""Normalized, validated market data as Parquet — one file per series.
+"""Validated market data as Parquet — one file per series.
 
-Layout: normalized/{dataset}/provider=../market=../symbol=../[interval=../]data.parquet
+Layout: processed/{dataset}/provider=../market=../symbol=../[interval=../]data.parquet
 
 Data volumes are small (≈25k rows per 1h series over 3 years), so each series
 is merged in memory and rewritten atomically. Swap for Delta Lake later
@@ -72,8 +72,12 @@ class ParquetStore:
         os.replace(tmp, path)
 
 
-class QuarantineStore:
-    """Rows that failed ERROR-level checks, one file per run, with ``dq_reason``."""
+class RejectedStore:
+    """Rejected records: rows that failed error-level checks, duplicates and still-open candles.
+
+    One file per run at rejected/{dataset}/{run_id}.parquet, canonical columns + ``dq_reason``
+    + ``run_id``. Kept so nothing is ever silently discarded.
+    """
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root)

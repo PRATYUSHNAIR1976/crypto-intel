@@ -15,11 +15,13 @@ from cryptointel.logging_config import configure_logging
 from cryptointel.providers.base import MarketDataProvider
 from cryptointel.providers.registry import PROVIDER_NAMES, build_provider
 from cryptointel.storage.catalog import Catalog
-from cryptointel.storage.parquet_store import ParquetStore, QuarantineStore
+from cryptointel.storage.parquet_store import ParquetStore, RejectedStore
 from cryptointel.storage.query import MarketDataRepository
 from cryptointel.storage.raw import RawStore
 from cryptointel.validation.audit import audit_store
-from cryptointel.validation.validator import Severity
+from cryptointel.validation.report import report_frame
+from cryptointel.validation.rules import load_dq_config
+from cryptointel.validation.validator import Status
 
 
 def _csv(value: str | None) -> list[str] | None:
@@ -55,9 +57,10 @@ def _resolve_option(cli_value: str | None, defaults: list[str], enum, supported)
 def _print_reports(reports: list[IngestionReport]) -> None:
     rows = [{
         "job": r.job.label(), "status": r.status, "from": r.effective_start.strftime("%Y-%m-%d %H:%M") if r.effective_start else "",
-        "fetched": r.rows_fetched, "new": r.rows_written, "quarantined": r.rows_quarantined,
-        "dropped": r.rows_dropped, "score": r.quality_score if r.quality_score is not None else "",
-        "warnings": sum(i.severity is Severity.WARNING for i in r.issues),
+        "fetched": r.rows_fetched, "new": r.rows_written, "rejected": r.rows_rejected,
+        "open_candles": r.rows_dropped, "score": r.quality_score if r.quality_score is not None else "",
+        "failed_checks": sum(c.status is Status.FAIL for c in r.checks),
+        "warned_checks": sum(c.status is Status.WARN for c in r.checks),
         "error": (r.error or "")[:80],
     } for r in reports]
     print(pd.DataFrame(rows).to_string(index=False))
@@ -80,7 +83,8 @@ def cmd_ingest(args: argparse.Namespace, settings: Settings) -> int:
         return 0
     pipeline = IngestionPipeline(
         provider, RawStore(settings.raw_dir), ParquetStore(settings.processed_dir),
-        QuarantineStore(settings.quarantine_dir), Catalog(settings.catalog_path), incremental=not args.full_refresh,
+        RejectedStore(settings.rejected_dir), Catalog(settings.catalog_path), incremental=not args.full_refresh,
+        dq_config=load_dq_config(settings.dq_rules_path),
     )
     reports = pipeline.run_all(jobs)
     _print_reports(reports)
@@ -88,24 +92,32 @@ def cmd_ingest(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def cmd_validate(args: argparse.Namespace, settings: Settings) -> int:
-    audits = audit_store(ParquetStore(settings.processed_dir), Catalog(settings.catalog_path))
+    """Audit all stored data, print a summary and findings, and save the full DQ report as CSV."""
+    audits, rows = audit_store(ParquetStore(settings.processed_dir), Catalog(settings.catalog_path),
+                               config=load_dq_config(settings.dq_rules_path))
     if not audits:
         print("No data stored yet. Run `cip ingest` first.")
         return 0
     summary = pd.DataFrame([{
-        "dataset": a.dataset, "symbol": a.symbol, "market": a.market, "interval": a.interval or "-",
-        "rows": a.rows, "first": (a.first_ts or "")[:16], "last": (a.last_ts or "")[:16], "score": a.quality_score,
-        "errors": sum(i.severity is Severity.ERROR for i in a.issues),
-        "warnings": sum(i.severity is Severity.WARNING for i in a.issues),
+        "dataset": a.dataset, "provider": a.provider, "symbol": a.symbol, "market": a.market,
+        "timeframe": a.interval or "-", "rows": a.result.input_rows, "first": (a.first_ts or "")[:16],
+        "last": (a.last_ts or "")[:16], "checks": len(a.result.checks),
+        "fail": sum(c.status is Status.FAIL for c in a.result.checks),
+        "warn": sum(c.status is Status.WARN for c in a.result.checks),
     } for a in audits])
     print(summary.to_string(index=False))
-    findings = [(a, i) for a in audits for i in a.issues if i.severity is not Severity.INFO]
-    if findings:
-        print("\nFindings:")
-        for a, i in findings:
-            print(f"  [{i.severity.upper():7}] {a.dataset}:{a.symbol}:{a.market}:{a.interval or '-'} "
-                  f"{i.check} ({i.affected_rows} rows) — {i.message} sample={i.sample[:3]}")
-    return 1 if any(i.severity is Severity.ERROR for _, i in findings) else 0
+
+    report = report_frame(rows)
+    findings = report[report["status"] != "pass"]
+    if not findings.empty:
+        print("\nFindings (non-passing checks):")
+        cols = ["dataset", "provider", "symbol", "timeframe", "check_name", "status", "failed_rows", "total_rows"]
+        print(findings[cols].to_string(index=False))
+    settings.reports_dir.mkdir(parents=True, exist_ok=True)
+    path = settings.reports_dir / f"dq_report_{report['run_timestamp'].iat[0][:19].replace(':', '')}Z.csv"
+    report.to_csv(path, index=False)
+    print(f"\nFull DQ report ({len(report)} check results): {path}")
+    return 1 if (findings["status"] == "fail").any() else 0
 
 
 def cmd_summary(args: argparse.Namespace, settings: Settings) -> int:

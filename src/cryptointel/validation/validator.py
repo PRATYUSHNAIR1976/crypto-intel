@@ -1,17 +1,20 @@
-"""Provider-agnostic data-quality validation and cleaning.
+"""Deterministic, configurable market-data quality checks.
 
-Severity policy:
-  ERROR   -> row is quarantined (kept on disk with a reason, never used downstream)
-  WARNING -> row is kept; issue is reported (gaps, outliers, duplicates resolved)
-  INFO    -> expected housekeeping (e.g. still-open candle dropped)
+A batch passes through three stages:
+  1. Row checks on the input (nulls, duplicates, timestamps, OHLC relationships, signs).
+     Rows failing an ``error`` check are REJECTED. Earlier copies of a duplicated key are
+     always rejected (the last copy is kept). Still-open candles are excluded.
+  2. Value checks on the surviving rows (price jumps, zero/missing volume, extreme funding).
+  3. Series checks on the validated rows (missing timestamps, unexpected gaps); report only.
 
-Validation never invents data: gaps are reported, not filled.
+Every enabled, applicable check produces a ``CheckResult``, including passes, so the DQ
+report is complete. Nothing is repaired: rejected rows keep their reasons, gaps are not filled.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import StrEnum
 
 import numpy as np
@@ -19,57 +22,132 @@ import pandas as pd
 
 from cryptointel.domain.models import Dataset, Interval, utc_now
 from cryptointel.domain.schemas import PRIMARY_KEYS, REQUIRED_NON_NULL, coerce
+from cryptointel.validation.rules import DQConfig, Severity, default_dq_config
+
+__all__ = ["CHECKS", "CheckResult", "Severity", "Status", "ValidationResult", "validate"]
 
 SAMPLE_SIZE = 5
-OUTLIER_ROBUST_Z = 12.0  # deliberately loose: crypto has fat tails; flag only egregious moves
-OUTLIER_MIN_ROWS = 30
-EXTREME_FUNDING_RATE = 0.03  # 3% per funding period
-FUTURE_TOLERANCE = timedelta(minutes=1)
+_ALL = frozenset(Dataset)
+_OHLCV = frozenset({Dataset.OHLCV})
+_GRID = frozenset({Dataset.OHLCV, Dataset.OPEN_INTEREST})  # datasets on a fixed interval grid
+
+# check name -> datasets it applies to
+CHECKS: dict[str, frozenset[Dataset]] = {
+    "null_values": _ALL,
+    "duplicate_timestamps": _ALL,
+    "future_timestamp": _ALL,
+    "misaligned_timestamp": _GRID,
+    "incomplete_candle": _OHLCV,
+    "high_below_low": _OHLCV,
+    "high_below_open": _OHLCV,
+    "high_below_close": _OHLCV,
+    "low_above_open": _OHLCV,
+    "low_above_close": _OHLCV,
+    "negative_price": frozenset({Dataset.OHLCV, Dataset.FUNDING}),
+    "zero_price": _OHLCV,
+    "negative_volume": _GRID,
+    "taker_volume_exceeds_volume": _OHLCV,
+    "extreme_price_jump": _OHLCV,
+    "zero_volume": _OHLCV,
+    "missing_volume": _OHLCV,
+    "extreme_funding_rate": frozenset({Dataset.FUNDING}),
+    "missing_timestamps": _GRID,
+    "timestamp_gaps": _GRID,
+}
+_NEEDS_INTERVAL = {"misaligned_timestamp", "incomplete_candle", "extreme_price_jump", "missing_timestamps", "timestamp_gaps"}
+
+_PRICE_COLS = {Dataset.OHLCV: ["open", "high", "low", "close"], Dataset.FUNDING: ["mark_price"]}
+_VOLUME_COLS = {
+    Dataset.OHLCV: ["volume", "quote_volume", "taker_buy_volume", "taker_buy_quote_volume"],
+    Dataset.OPEN_INTEREST: ["open_interest", "open_interest_value"],
+}
 
 
-class Severity(StrEnum):
+class Status(StrEnum):
+    PASS = "pass"
+    WARN = "warn"
+    FAIL = "fail"
     INFO = "info"
-    WARNING = "warning"
-    ERROR = "error"
+
+
+_STATUS_FOR = {Severity.ERROR: Status.FAIL, Severity.WARNING: Status.WARN, Severity.INFO: Status.INFO}
 
 
 @dataclass
-class QualityIssue:
-    check: str
+class CheckResult:
+    check_name: str
     severity: Severity
-    affected_rows: int
-    message: str
+    status: Status
+    failed_rows: int
+    total_rows: int
+    message: str = ""
     sample: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return {**asdict(self), "severity": self.severity.value}
+        return {**asdict(self), "severity": self.severity.value, "status": self.status.value}
 
 
 @dataclass
 class ValidationResult:
-    clean: pd.DataFrame
-    quarantined: pd.DataFrame  # canonical columns + dq_reason
-    issues: list[QualityIssue]
+    validated: pd.DataFrame
+    rejected: pd.DataFrame  # canonical columns + dq_reason (";"-separated check names)
+    checks: list[CheckResult]
     input_rows: int
-    dropped_rows: int  # duplicates + incomplete candles (not quarantined, not errors)
+    excluded_rows: int  # rows held back for non-quality reasons (still-open candles)
+
+    @property
+    def issues(self) -> list[CheckResult]:
+        return [c for c in self.checks if c.status is not Status.PASS]
 
     @property
     def has_errors(self) -> bool:
-        return any(i.severity is Severity.ERROR for i in self.issues)
+        return any(c.status is Status.FAIL for c in self.checks)
 
     @property
     def quality_score(self) -> float:
-        """Share of usable input rows that passed all ERROR checks (1.0 = perfect)."""
-        usable = self.input_rows - self.dropped_rows
-        return 1.0 if usable <= 0 else round(len(self.clean) / usable, 6)
+        """Share of assessable input rows that were validated (1.0 = perfect)."""
+        assessable = self.input_rows - self.excluded_rows
+        return 1.0 if assessable <= 0 else round(len(self.validated) / assessable, 6)
+
+    def check(self, name: str) -> CheckResult:
+        return next(c for c in self.checks if c.check_name == name)
 
 
-def _sample(ts: pd.Series) -> list[str]:
-    return [t.isoformat() for t in ts.head(SAMPLE_SIZE)]
+def _sample(ts: pd.Series | pd.Index) -> list[str]:
+    return [t.isoformat() for t in list(ts)[:SAMPLE_SIZE]]
 
 
-def _series_keys(dataset: Dataset) -> list[str]:
-    return [k for k in PRIMARY_KEYS[dataset] if k != "ts"]
+class _Run:
+    """Accumulates check results and per-row rejection reasons for one batch."""
+
+    def __init__(self, df: pd.DataFrame, dataset: Dataset, interval: Interval | None, config: DQConfig) -> None:
+        self.df, self.dataset, self.interval, self.config = df, dataset, interval, config
+        self.reasons = pd.Series("", index=df.index, dtype="object")
+        self.checks: list[CheckResult] = []
+
+    def active(self, name: str) -> bool:
+        if not self.config.enabled(name) or self.dataset not in CHECKS[name]:
+            return False
+        return self.interval is not None or name not in _NEEDS_INTERVAL
+
+    def record(self, name: str, failed: int, total: int, message: str, sample: list[str]) -> Severity:
+        severity = self.config.rule(name).severity
+        status = _STATUS_FOR[severity] if failed else Status.PASS
+        self.checks.append(CheckResult(name, severity, status, failed, total, message if failed else "", sample))
+        return severity
+
+    def row_check(self, name: str, mask: pd.Series, message: str, scope: pd.Series, reject: bool | None = None) -> None:
+        """Evaluate ``mask`` over rows in ``scope``; reject failures if severity is error (or ``reject``)."""
+        if not self.active(name):
+            return
+        mask = mask.reindex(self.df.index, fill_value=False).fillna(False).astype(bool) & scope
+        failed = int(mask.sum())
+        severity = self.record(name, failed, int(scope.sum()), message, _sample(self.df.loc[mask, "ts"]))
+        if failed and (reject if reject is not None else severity is Severity.ERROR):
+            self.reasons.loc[mask] = self.reasons.loc[mask] + name + ";"
+
+    def surviving(self) -> pd.Series:
+        return self.reasons == ""
 
 
 def validate(
@@ -77,120 +155,118 @@ def validate(
     dataset: Dataset,
     interval: Interval | None = None,
     now: datetime | None = None,
-    drop_incomplete: bool = True,
+    config: DQConfig | None = None,
+    check_incomplete: bool = True,
 ) -> ValidationResult:
-    now = now or utc_now()
+    config = config or default_dq_config()
+    now = pd.Timestamp(now or utc_now())
     df = coerce(df, dataset).reset_index(drop=True)
-    input_rows = len(df)
-    issues: list[QualityIssue] = []
-    dropped = 0
-
-    # --- duplicates: keep the most recently fetched version of each key
+    run = _Run(df, dataset, interval, config)
+    everyone = pd.Series(True, index=df.index)
     keys = PRIMARY_KEYS[dataset]
-    dup_mask = df.duplicated(subset=keys, keep="last")
-    if dup_mask.any():
-        issues.append(QualityIssue("duplicate_rows", Severity.WARNING, int(dup_mask.sum()),
-                                   "Duplicate primary keys; kept the last occurrence.", _sample(df.loc[dup_mask, "ts"])))
-        dropped += int(dup_mask.sum())
-        df = df.loc[~dup_mask].reset_index(drop=True)
 
-    # --- still-open candle: its OHLCV will change, so never store it
-    if dataset is Dataset.OHLCV and drop_incomplete and interval is not None and len(df):
-        open_mask = (df["ts"] + interval.timedelta) > pd.Timestamp(now)
-        if open_mask.any():
-            issues.append(QualityIssue("incomplete_candle", Severity.INFO, int(open_mask.sum()),
-                                       "Candle has not closed yet; dropped.", _sample(df.loc[open_mask, "ts"])))
-            dropped += int(open_mask.sum())
-            df = df.loc[~open_mask].reset_index(drop=True)
+    # ---- stage 1: row checks ------------------------------------------------------
+    duplicate = df.duplicated(subset=keys, keep="last")
+    run.row_check("duplicate_timestamps", duplicate, "Duplicate primary key; earlier copies rejected, last kept.",
+                  everyone, reject=True)
+    unique = ~duplicate
 
-    reasons = pd.Series([""] * len(df), index=df.index, dtype="object")
+    required = REQUIRED_NON_NULL[dataset]
+    nulls = df[required].isna()
+    null_cols = {c: int(n) for c, n in nulls[unique].sum().items() if n}
+    run.row_check("null_values", nulls.any(axis=1), f"Null or unparseable required fields: {null_cols}.", unique)
 
-    def flag(mask: pd.Series, check: str, message: str, severity: Severity = Severity.ERROR) -> None:
-        mask = mask.fillna(False).astype(bool)
-        n = int(mask.sum())
-        if not n:
-            return
-        issues.append(QualityIssue(check, severity, n, message, _sample(df.loc[mask, "ts"])))
-        if severity is Severity.ERROR:
-            reasons.loc[mask] = reasons.loc[mask] + check + ";"
-
-    # --- row-level ERROR checks
-    for col in REQUIRED_NON_NULL[dataset]:
-        flag(df[col].isna(), f"null_{col}", f"Required field '{col}' is null or unparseable.")
-
-    flag(df["ts"] > pd.Timestamp(now + FUTURE_TOLERANCE), "future_timestamp", "Timestamp is in the future.")
-
-    if interval is not None and dataset in (Dataset.OHLCV, Dataset.OPEN_INTEREST):
+    run.row_check("future_timestamp", df["ts"] > now + config.future_tolerance, "Timestamp is in the future.", unique)
+    if interval is not None:
         epoch_ms = df["ts"].astype("int64") // 1_000_000
-        flag(epoch_ms % interval.ms != 0, "misaligned_timestamp",
-             f"Timestamp is not aligned to the {interval} grid.")
+        run.row_check("misaligned_timestamp", epoch_ms % interval.ms != 0,
+                      f"Timestamp not aligned to the {interval} grid.", unique)
+        if check_incomplete:
+            run.row_check("incomplete_candle", df["ts"] + interval.timedelta > now,
+                          "Candle has not closed yet; excluded until it closes.", unique, reject=True)
 
     if dataset is Dataset.OHLCV:
-        o, h, l, c = df["open"], df["high"], df["low"], df["close"]
-        flag((o <= 0) | (h <= 0) | (l <= 0) | (c <= 0), "non_positive_price", "OHLC contains a price <= 0.")
-        flag((df["volume"] < 0) | (df["quote_volume"] < 0), "negative_volume", "Volume is negative.")
-        flag((h < np.maximum.reduce([o, c, l])) | (l > np.minimum.reduce([o, c, h])), "ohlc_inconsistent",
-             "High/low do not bound open/close.")
-        flag(df["taker_buy_volume"] > df["volume"] * (1 + 1e-9), "taker_volume_exceeds_volume",
-             "Taker-buy volume exceeds total volume.")
+        o, h, lo, c = df["open"], df["high"], df["low"], df["close"]
+        run.row_check("high_below_low", h < lo, "high < low.", unique)
+        run.row_check("high_below_open", h < o, "high < open.", unique)
+        run.row_check("high_below_close", h < c, "high < close.", unique)
+        run.row_check("low_above_open", lo > o, "low > open.", unique)
+        run.row_check("low_above_close", lo > c, "low > close.", unique)
+        run.row_check("zero_price", (df[_PRICE_COLS[dataset]] == 0).any(axis=1), "A price is exactly zero.", unique)
+        run.row_check("taker_volume_exceeds_volume", df["taker_buy_volume"] > df["volume"] * (1 + 1e-9),
+                      "Taker-buy volume exceeds total volume.", unique)
+    if dataset in _PRICE_COLS:
+        run.row_check("negative_price", (df[_PRICE_COLS[dataset]] < 0).any(axis=1), "A price is negative.", unique)
+    if dataset in _VOLUME_COLS:
+        run.row_check("negative_volume", (df[_VOLUME_COLS[dataset]] < 0).any(axis=1), "A volume/size is negative.",
+                      unique)
 
-    if dataset is Dataset.OPEN_INTEREST:
-        flag(df["open_interest"] < 0, "negative_open_interest", "Open interest is negative.")
-
-    quarantined = df.loc[reasons != ""].assign(dq_reason=reasons[reasons != ""].str.rstrip(";"))
-    clean = df.loc[reasons == ""].sort_values(keys).reset_index(drop=True)
-
-    # --- WARNING checks on clean data (reported, rows kept)
+    # ---- stage 2: value checks on survivors -------------------------------------
+    survivors = run.surviving()
     if dataset is Dataset.OHLCV:
-        no_volume = clean["volume"].isna()
-        if no_volume.any():
-            issues.append(QualityIssue("missing_volume", Severity.WARNING, int(no_volume.sum()),
-                                       "Source provides no volume for these candles (volume-based features unavailable).",
-                                       _sample(clean.loc[no_volume, "ts"])))
-        zero = clean["volume"] == 0
-        if zero.any():
-            issues.append(QualityIssue("zero_volume", Severity.WARNING, int(zero.sum()),
-                                       "Candle has zero volume (possible halt/maintenance).", _sample(clean.loc[zero, "ts"])))
-
+        if interval is not None and run.active("extreme_price_jump"):
+            threshold = config.max_abs_return.get(interval.value)
+            if threshold is not None:
+                ret = _returns(df.loc[survivors], dataset)
+                run.row_check("extreme_price_jump", ret.abs() > threshold,
+                              f"|close-to-close return| > {threshold:.0%} for {interval}.", survivors)
+        run.row_check("zero_volume", df["volume"] == 0, "Volume is zero (halt or maintenance?).", survivors)
+        run.row_check("missing_volume", df["volume"].isna(),
+                      "Source provides no volume (volume-based features unavailable).", survivors)
     if dataset is Dataset.FUNDING:
-        extreme = clean["funding_rate"].abs() > EXTREME_FUNDING_RATE
-        if extreme.any():
-            issues.append(QualityIssue("extreme_funding_rate", Severity.WARNING, int(extreme.sum()),
-                                       f"|funding rate| > {EXTREME_FUNDING_RATE:.0%} per period.", _sample(clean.loc[extreme, "ts"])))
+        limit = config.extreme_funding_rate
+        run.row_check("extreme_funding_rate", df["funding_rate"].abs() > limit,
+                      f"|funding rate| > {limit:.2%} per period.", survivors)
 
-    if interval is not None and dataset in (Dataset.OHLCV, Dataset.OPEN_INTEREST) and len(clean):
-        for _, series in clean.groupby(_series_keys(dataset), sort=False):
-            issues.extend(_gap_issues(series, interval))
-            if dataset is Dataset.OHLCV:
-                issues.extend(_outlier_issues(series))
+    # ---- split ------------------------------------------------------------------
+    survivors = run.surviving()
+    validated = df.loc[survivors].sort_values(keys).reset_index(drop=True)
+    rejected = df.loc[~survivors].assign(dq_reason=run.reasons[~survivors].str.rstrip(";"))
+    excluded = int(rejected["dq_reason"].eq("incomplete_candle").sum()) if len(rejected) else 0
 
-    return ValidationResult(clean, quarantined, issues, input_rows, dropped)
+    # ---- stage 3: series checks on validated rows -------------------------------
+    if interval is not None and dataset in _GRID:
+        _series_checks(run, validated, interval, config)
+
+    return ValidationResult(validated, rejected, run.checks, len(df), excluded)
 
 
-def _gap_issues(series: pd.DataFrame, interval: Interval) -> list[QualityIssue]:
-    ts = series["ts"]
-    expected = pd.date_range(ts.min(), ts.max(), freq=interval.timedelta)
-    missing = expected.difference(pd.DatetimeIndex(ts))
+def _returns(frame: pd.DataFrame, dataset: Dataset) -> pd.Series:
+    """Close-to-close return within each series (first row of a series has none)."""
+    series_keys = [k for k in PRIMARY_KEYS[dataset] if k != "ts"]
+    ordered = frame.sort_values(series_keys + ["ts"])
+    return ordered.groupby(series_keys, sort=False)["close"].pct_change()
+
+
+def _series_checks(run: _Run, validated: pd.DataFrame, interval: Interval, config: DQConfig) -> None:
+    missing_all: list[pd.DatetimeIndex] = []
+    expected_total = 0
+    series_keys = [k for k in PRIMARY_KEYS[run.dataset] if k != "ts"]
+    for _, series in (validated.groupby(series_keys, sort=False) if len(validated) else []):
+        expected = pd.date_range(series["ts"].min(), series["ts"].max(), freq=interval.timedelta)
+        expected_total += len(expected)
+        missing_all.append(expected.difference(pd.DatetimeIndex(series["ts"])))
+    missing = missing_all[0].append(missing_all[1:]) if missing_all else pd.DatetimeIndex([], tz="UTC")
+
+    if run.active("missing_timestamps"):
+        run.record("missing_timestamps", len(missing), expected_total,
+                   f"{len(missing)} expected {interval} timestamps are missing (not filled).", _sample(missing))
+
+    if run.active("timestamp_gaps"):
+        runs = _gap_runs(missing, interval)
+        long_runs = [(start, n) for start, n in runs if n > config.max_gap_intervals]
+        failed = sum(n for _, n in long_runs)
+        largest = max(long_runs, key=lambda r: r[1]) if long_runs else None
+        message = (f"{len(long_runs)} gap(s) longer than {config.max_gap_intervals} x {interval}; "
+                   f"largest {largest[1]} x {interval} from {largest[0].isoformat()}.") if largest else ""
+        run.record("timestamp_gaps", failed, expected_total, message, [s.isoformat() for s, _ in long_runs[:SAMPLE_SIZE]])
+
+
+def _gap_runs(missing: pd.DatetimeIndex, interval: Interval) -> list[tuple[pd.Timestamp, int]]:
+    """Group missing timestamps into runs of consecutive intervals: [(run_start, length)]."""
     if missing.empty:
         return []
-    label = f"{series['symbol'].iat[0]} {series['market'].iat[0]} {interval}"
-    return [QualityIssue("missing_intervals", Severity.WARNING, len(missing),
-                         f"{label}: {len(missing)} expected timestamps missing between {ts.min()} and {ts.max()} (not filled).",
-                         [t.isoformat() for t in missing[:SAMPLE_SIZE]])]
-
-
-def _outlier_issues(series: pd.DataFrame) -> list[QualityIssue]:
-    if len(series) < OUTLIER_MIN_ROWS:
-        return []
-    log_ret = np.log(series["close"]).diff()
-    median = log_ret.median()
-    mad = (log_ret - median).abs().median()
-    if not mad or np.isnan(mad):
-        return []
-    robust_z = 0.6745 * (log_ret - median) / mad
-    mask = robust_z.abs() > OUTLIER_ROBUST_Z
-    if not mask.any():
-        return []
-    return [QualityIssue("price_outlier", Severity.WARNING, int(mask.sum()),
-                         f"Close-to-close move with robust z-score > {OUTLIER_ROBUST_Z:g} (kept; verify against another source).",
-                         _sample(series.loc[mask, "ts"]))]
+    ordered = missing.sort_values()
+    breaks = np.flatnonzero(np.diff(ordered.asi8) != interval.ms * 1_000_000) + 1
+    starts, ends = np.r_[0, breaks], np.r_[breaks, len(ordered)]
+    return [(ordered[s], int(e - s)) for s, e in zip(starts, ends)]

@@ -5,7 +5,7 @@ It runs entirely on your machine using free public market data. It does **not**
 place trades, connect to exchange accounts or call paid APIs.
 
 > Status: **Phase 1, the data foundation.** Ingestion, raw storage, data-quality
-> validation, normalized Parquet storage, a DuckDB query layer, and a read-only API.
+> configurable data-quality validation, processed Parquet storage, a DuckDB query layer, and a read-only API.
 > See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and phase plan.
 
 ## Quick start
@@ -54,24 +54,42 @@ strategy-side packages import providers, storage, ingestion, HTTP or database cl
 ## Pipeline
 
 ```
-Binance public REST ──▶ raw/ (gzipped JSON, immutable)
-                     └▶ validate ──▶ normalized/ (Parquet, canonical schema)
-                                 └▶ quarantine/ (failed rows + reason)
-                     every run + issue ──▶ catalog.sqlite
-normalized/ ──DuckDB──▶ FastAPI (read-only)
+provider REST ──▶ data/raw/        gzipped JSON, exactly as received (immutable)
+              └▶ validate ──▶ data/processed/  validated rows, canonical Parquet
+                          ├─▶ data/rejected/   rejected rows + dq_reason (never silently dropped)
+                          └─▶ DQ report        catalog.sqlite (dq_report) + data/reports/*.csv
+data/processed/ ──DuckDB──▶ MarketDataReader ──▶ FastAPI (read-only)
 ```
 
-**Data-quality checks.** Errors are quarantined. Warnings are kept and reported.
-Gaps are never filled.
+Logs are structured JSON on stderr (`CIP_LOG_FORMAT=text` gives key=value lines).
 
-| Check | Severity |
-|---|---|
-| null/unparseable OHLC or timestamp, future or misaligned timestamp | error |
-| volume not provided by source (e.g. index data) | warning |
-| price ≤ 0, negative volume, high/low not bounding open/close, taker volume > volume | error |
-| negative open interest | error |
-| duplicate keys (last wins), missing intervals, zero volume, extreme funding, price outliers (robust z > 12) | warning |
-| still-open candle | info (dropped) |
+## Data quality
+
+Deterministic checks, configured in
+[`validation/dq_rules.toml`](src/cryptointel/validation/dq_rules.toml). Override any
+subset with your own TOML via `CIP_DQ_RULES_PATH`; typos in check names are rejected.
+Severity `error` rejects the row, `warning` keeps it and reports it. Nothing is ever
+repaired, and gaps are never filled.
+
+| Check | Default | Applies to |
+|---|---|---|
+| `null_values` | error | all |
+| `duplicate_timestamps`: earlier copies go to rejected, last kept | warning | all |
+| `future_timestamp`, `misaligned_timestamp` | error | all / gridded |
+| `high_below_low`, `high_below_open`, `high_below_close`, `low_above_open`, `low_above_close` | error | OHLCV |
+| `negative_price`, `zero_price` | error | OHLCV (+ funding mark price) |
+| `negative_volume`, `taker_volume_exceeds_volume` | error | OHLCV, open interest |
+| `extreme_price_jump`: \|close-to-close\| > 10% / 15% / 25% / 40% for 15m / 1h / 4h / 1d | warning | OHLCV |
+| `zero_volume`, `missing_volume`, `extreme_funding_rate` | warning | OHLCV / funding |
+| `missing_timestamps`: every missing candle | warning | gridded series |
+| `timestamp_gaps`: runs longer than `max_gap_intervals` (1) | warning | gridded series |
+| `incomplete_candle`: still open, excluded until it closes | info | OHLCV |
+
+**DQ report:** one row per series × check, passes included. Columns: `run_timestamp, run_id,
+scope, dataset, provider, market, symbol, timeframe, check_name, severity, status
+(pass|info|warn|fail), failed_rows, total_rows, message, sample`. `cip validate` audits all
+stored history and writes `data/reports/dq_report_<UTC>.csv`. Ingestion records a report
+for every batch. `GET /api/v1/data-quality` serves it.
 
 ## Tests
 
